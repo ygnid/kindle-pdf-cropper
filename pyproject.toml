@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +8,24 @@ version = "0.1.0"
 description = "Auto-crop PDF margins / headers / footers and optionally split pages into Kindle-friendly landscape pages (PDF or EPUB output)"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "kindle-pdf-cropper contributors" }]
-keywords = ["pdf", "kindle", "crop", "epub", "ebook", "margins", "header", "footer"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "ygnid" }]
+maintainers = [{ name = "ygnid" }]
+keywords = ["pdf", "kindle", "crop", "epub", "ebook", "margins", "header", "footer", "ebook-reader"]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Topic :: Text Processing",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Text Processing",
+    "Topic :: Text Processing :: Markup :: HTML",
 ]
 dependencies = [
     "pymupdf>=1.26.4,<3",
@@ -25,11 +36,19 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 
+[project.urls]
+Homepage = "https://github.com/ygnid/kindle-pdf-cropper"
+Repository = "https://github.com/ygnid/kindle-pdf-cropper"
+Documentation = "https://github.com/ygnid/kindle-pdf-cropper/blob/main/README.md"
+
 [project.scripts]
 kindle-crop = "kindle_pdf_cropper.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools]
+include-package-data = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
