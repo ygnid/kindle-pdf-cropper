@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kindle-pdf-cropper"
+version = "0.1.0"
+description = "Auto-crop PDF margins / headers / footers and optionally split pages into Kindle-friendly landscape pages (PDF or EPUB output)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "kindle-pdf-cropper contributors" }]
+keywords = ["pdf", "kindle", "crop", "epub", "ebook", "margins", "header", "footer"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing",
+    "Environment :: Console",
+]
+dependencies = [
+    "pymupdf>=1.26.4,<3",
+    "numpy>=1.24",
+    "pillow>=9.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+kindle-crop = "kindle_pdf_cropper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
