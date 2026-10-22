@@ -531,7 +531,7 @@ def analyze_document(
     plans: list[PagePlan] = []
     for feats in feats_list:
         crop = _crop_rect(feats, config)
-        segments = _make_segments(crop, config)
+        segments = _make_segments(crop, config, feats)
         plans.append(
             PagePlan(
                 index=feats.index,
@@ -547,7 +547,9 @@ def analyze_document(
     return plans, feats_list
 
 
-def _make_segments(crop: fitz.Rect, config: Config) -> list[Segment]:
+def _make_segments(
+    crop: fitz.Rect, config: Config, feats: PageFeatures | None = None
+) -> list[Segment]:
     def seg(clip: fitz.Rect) -> Segment:
         return Segment(
             clip=clip, width=abs(clip.width), height=abs(clip.height)
@@ -556,14 +558,121 @@ def _make_segments(crop: fitz.Rect, config: Config) -> list[Segment]:
     if not config.split:
         return [seg(crop)]
 
-    h = abs(crop.y1 - crop.y0)
-    if h <= 2 * config.split_overlap_min_pt + 2:
-        return [seg(crop)]
-    overlap = max(config.split_overlap_ratio * h, config.split_overlap_min_pt)
-    mid = (crop.y0 + crop.y1) / 2.0
-    top = fitz.Rect(crop.x0, crop.y0, crop.x1, mid + overlap)
-    bottom = fitz.Rect(crop.x0, mid - overlap, crop.x1, crop.y1)
+    overlap_mode = (
+        config.split_overlap_ratio is not None
+        or config.split_overlap_min_pt is not None
+    )
+    if overlap_mode:
+        h = abs(crop.y1 - crop.y0)
+        if h <= 2 * (config.split_overlap_min_pt or 0) + 2:
+            return [seg(crop)]
+        overlap = max(
+            (config.split_overlap_ratio or 0.0) * h,
+            config.split_overlap_min_pt or 0.0,
+        )
+        mid = (crop.y0 + crop.y1) / 2.0
+        top = fitz.Rect(crop.x0, crop.y0, crop.x1, mid + overlap)
+        bottom = fitz.Rect(crop.x0, mid - overlap, crop.x1, crop.y1)
+        return [seg(top), seg(bottom)]
+
+    # --- adaptive: cut in the whitespace between two lines ----------------
+    split_y = _adaptive_split_y(feats, crop) if feats is not None else (
+        (crop.y0 + crop.y1) / 2.0
+    )
+    split_y = max(crop.y0 + 1e-3, min(crop.y1 - 1e-3, split_y))
+    top = fitz.Rect(crop.x0, crop.y0, crop.x1, split_y)
+    bottom = fitz.Rect(crop.x0, split_y, crop.x1, crop.y1)
     return [seg(top), seg(bottom)]
+
+
+def _adaptive_split_y(feats: PageFeatures, crop: fitz.Rect) -> float:
+    """Choose the best horizontal cut position inside `crop`.
+
+    The goal is to place the cut in the *blank space between two lines*
+    (two text baselines), so no glyph row is cut and the two halves need no
+    overlap.  Candidates are (in priority order):
+
+    1. text-based: the gap between two consecutive text line boxes
+       (exact for born-digital PDFs);
+    2. raster-based: runs of ink-free rows in the block projection
+       (works for scanned PDFs, rotated pages and any page).
+
+    The candidate whose centre is closest to the crop's vertical middle wins;
+    wider gaps are preferred on ties.
+    """
+    mid = (crop.y0 + crop.y1) / 2.0
+    candidates: list[tuple[float, float, float]] = []  # (|d-mid|, -width, y)
+
+    # --- 1) text line gaps (text pages, unrotated) -------------------------
+    if feats.lines and not feats.had_rotation:
+        lines = sorted(
+            (
+                ln
+                for ln in feats.lines
+                if crop.y0 - 2 <= (ln.bbox.y0 + ln.bbox.y1) / 2 <= crop.y1 + 2
+            ),
+            key=lambda ln: ln.bbox.y0,
+        )
+        sizes = [ln.size for ln in feats.lines if ln.size > 0]
+        median_line_h = (
+            float(np.median(sizes)) * 1.25 if sizes else feats.height * 0.02
+        )
+        min_gap = 0.4 * median_line_h
+        for a, b in zip(lines, lines[1:]):
+            gap_top, gap_bot = a.bbox.y1, b.bbox.y0
+            w = gap_bot - gap_top
+            if w >= min_gap:
+                y = (gap_top + gap_bot) / 2.0
+                candidates.append((abs(y - mid), -w, y))
+
+    # --- 2) raster blank bands (scans, rotated pages, any page) ------------
+    hb, wb = feats.ink.shape
+    block = feats.block
+    ptpp = feats.pt_per_px
+    thr = max(2, int(0.0015 * wb))
+    active = feats.row_sums >= thr
+    y0_blk = max(0, int(math.floor(crop.y0 / ptpp / block)))
+    y1_blk = min(hb - 1, int(math.ceil(crop.y1 / ptpp / block)))
+    if y1_blk > y0_blk:
+        band = active[y0_blk : y1_blk + 1]
+        # reference gap width = median spacing between active row groups
+        groups = _row_groups(band, 1)
+        gaps = [
+            groups[i + 1][0] - groups[i][1] - 1
+            for i in range(len(groups) - 1)
+        ]
+        median_gap = float(np.median(gaps)) if gaps else 1.0
+        min_gap_blk = max(1, int(round(0.5 * median_gap)))
+        # runs of ink-free rows
+        run_start = None
+        for i, a in enumerate(band):
+            if not a:
+                if run_start is None:
+                    run_start = i
+            elif run_start is not None:
+                w = i - run_start
+                if w >= min_gap_blk:
+                    y = (
+                        (y0_blk + run_start) + (y0_blk + i) - 1
+                    ) / 2.0 * block * ptpp
+                    candidates.append((abs(y - mid), -w * block * ptpp, y))
+                run_start = None
+        if run_start is not None:
+            w = len(band) - run_start
+            if w >= min_gap_blk:
+                y = (y0_blk + run_start + y0_blk + y1_blk) / 2.0 * block * ptpp
+                candidates.append((abs(y - mid), -w * block * ptpp, y))
+
+    if not candidates:
+        return mid
+    # only consider gaps reasonably close to the vertical middle, so the two
+    # halves stay balanced (rotated scans with vertical text have almost no
+    # horizontal blank bands -- fall back to a plain middle cut then)
+    window = 0.25 * (crop.y1 - crop.y0)
+    near = [c for c in candidates if c[0] <= window]
+    if not near:
+        return mid
+    return min(near)[2]
 
 
 # --------------------------------------------------------------------------

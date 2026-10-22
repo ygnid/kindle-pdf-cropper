@@ -12,17 +12,31 @@ OVERLAP_PT = 20.0
 OVERLAP_RATIO = 0.03
 
 
-def split_analyze(path: str):
+def split_analyze(path: str, **cfg):
     src = fitz.open(path)
     try:
         work, rotations = normalize_work_doc(src)
         try:
-            cfg = Config(
+            c = Config(
                 split=True,
-                split_overlap_min_pt=OVERLAP_PT,
-                split_overlap_ratio=OVERLAP_RATIO,
+                split_overlap_min_pt=cfg.get("min_pt", OVERLAP_PT),
+                split_overlap_ratio=cfg.get("ratio", OVERLAP_RATIO),
             ).derived()
-            return analyze_document(work, rotations, cfg)
+            return analyze_document(work, rotations, c)
+        finally:
+            work.close()
+    finally:
+        src.close()
+
+
+def adaptive_split_analyze(path: str, **cfg):
+    """Split with no overlap parameters -> adaptive line-gap cut."""
+    src = fitz.open(path)
+    try:
+        work, rotations = normalize_work_doc(src)
+        try:
+            c = Config(split=True, **cfg).derived()
+            return analyze_document(work, rotations, c)
         finally:
             work.close()
     finally:
@@ -89,3 +103,44 @@ def test_split_overlap_amount(text_pdf):
         # the two halves together cover the whole crop
         assert top.clip.y0 == crop.y0 and bottom.clip.y1 == crop.y1
         assert bottom.clip.y0 < top.clip.y1  # real overlap exists
+
+
+def test_adaptive_split_no_overlap_and_between_lines(text_pdf):
+    plans, feats = adaptive_split_analyze(str(text_pdf))
+    assert all(len(p.segments) == 2 for p in plans)
+    for p, f in zip(plans, feats):
+        top, bottom = p.segments
+        # no overlap: halves are adjacent and cover the crop exactly
+        assert abs(top.clip.y1 - bottom.clip.y0) < 1e-6
+        assert top.clip.y0 == p.crop.y0 and bottom.clip.y1 == p.crop.y1
+        split_y = top.clip.y1
+        # the cut must not pass through any text line
+        for ln in f.lines:
+            if p.crop.y0 <= (ln.bbox.y0 + ln.bbox.y1) / 2 <= p.crop.y1:
+                assert not (ln.bbox.y0 < split_y < ln.bbox.y1), (
+                    split_y, ln.bbox
+                )
+
+
+def test_adaptive_split_scan_in_blank_band(scan_pdf):
+    plans, feats = adaptive_split_analyze(str(scan_pdf))
+    for p, f in zip(plans, feats):
+        top, bottom = p.segments
+        split_y = top.clip.y1
+        assert abs(top.clip.y1 - bottom.clip.y0) < 1e-6
+        # the cut falls on an ink-free band of the scanned page
+        blk = int(split_y / f.pt_per_px / f.block)
+        lo = max(0, blk - 1)
+        hi = min(f.ink.shape[0] - 1, blk + 1)
+        assert not f.row_sums[lo : hi + 1].any(), (split_y, blk)
+
+
+def test_adaptive_split_rotated_scan(scan_rot_pdf):
+    plans, feats = adaptive_split_analyze(str(scan_rot_pdf))
+    for p in plans:
+        top, bottom = p.segments
+        assert abs(top.clip.y1 - bottom.clip.y0) < 1e-6  # no overlap
+        # neither half may degenerate into a sliver
+        h = p.crop.height
+        assert top.clip.height >= 0.2 * h
+        assert bottom.clip.height >= 0.2 * h

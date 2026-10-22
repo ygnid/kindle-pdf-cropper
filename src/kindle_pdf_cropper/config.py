@@ -33,11 +33,20 @@ class Config:
 
     # -- page split (landscape for Kindle) --------------------------------
     #: Enabled via --split. Each page is cut horizontally into two pages.
+    #:
+    #: Two split strategies:
+    #:  * adaptive (default, when no overlap parameter is given): the cut
+    #:    line is placed in the whitespace *between two lines* (text bboxes
+    #:    for text PDFs, blank ink bands for scanned PDFs), so no line is
+    #:    ever cut and no overlap is needed.
+    #:  * overlap (when any overlap parameter is set): the page is cut at
+    #:    the vertical middle and the two halves overlap by
+    #:    max(ratio * height, min_pt).
     split: bool = False
     #: Overlap between the two halves, as a fraction of the *cropped* height.
-    split_overlap_ratio: float = 0.03
+    split_overlap_ratio: float | None = None
     #: ...and at least this many points (so a normal text line survives).
-    split_overlap_min_pt: float = 20.0
+    split_overlap_min_pt: float | None = None
 
     # -- rendering ----------------------------------------------------------
     #: DPI used for content analysis (raster projections).
@@ -71,8 +80,8 @@ class Config:
             raise ValueError("epub_mode must be one of: image, svg, auto")
         if c.epub_image_format not in ("jpeg", "png"):
             raise ValueError("epub_image_format must be jpeg or png")
-        if not 0.0 < c.split_overlap_ratio < 0.25:
+        if c.split_overlap_ratio is not None and not 0.0 < c.split_overlap_ratio < 0.25:
             raise ValueError("split_overlap_ratio must be in (0, 0.25)")
-        if c.split_overlap_min_pt < 1.0:
+        if c.split_overlap_min_pt is not None and c.split_overlap_min_pt < 1.0:
             raise ValueError("split_overlap_min_pt must be >= 1 pt")
         return c

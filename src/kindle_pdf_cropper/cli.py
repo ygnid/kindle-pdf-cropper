@@ -31,16 +31,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--split", action="store_true",
-        help="split every page horizontally into two landscape pages with a "
-        "small overlap (bigger text on Kindle)",
+        help="split every page horizontally into two landscape pages. "
+        "By default the cut is placed automatically in the whitespace "
+        "between two lines (no overlap, nothing is cut); set an overlap "
+        "parameter below to use a middle-cut with overlap instead",
     )
     p.add_argument(
-        "--split-overlap-pt", type=float, default=20.0,
-        help="minimum overlap between the two halves, in points",
+        "--split-overlap-pt", type=float, default=None, metavar="PT",
+        help="enable overlap mode: minimum overlap between the two halves, "
+        "in points (default: adaptive line-gap split without overlap)",
     )
     p.add_argument(
-        "--split-overlap-ratio", type=float, default=0.03,
-        help="overlap as a fraction of the cropped page height",
+        "--split-overlap-ratio", type=float, default=None,
+        help="enable overlap mode: overlap as a fraction of the cropped "
+        "page height (default: adaptive line-gap split without overlap)",
     )
     p.add_argument(
         "--padding", type=float, default=6.0, metavar="PT",
