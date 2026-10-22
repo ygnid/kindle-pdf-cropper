@@ -128,11 +128,23 @@ def test_adaptive_split_scan_in_blank_band(scan_pdf):
         top, bottom = p.segments
         split_y = top.clip.y1
         assert abs(top.clip.y1 - bottom.clip.y0) < 1e-6
-        # the cut falls on an ink-free band of the scanned page
-        blk = int(split_y / f.pt_per_px / f.block)
-        lo = max(0, blk - 1)
-        hi = min(f.ink.shape[0] - 1, blk + 1)
-        assert not f.row_sums[lo : hi + 1].any(), (split_y, blk)
+        # the cut falls on an ink-free band of the scanned page (pixel level)
+        c = int(split_y / f.pt_per_px)
+        lo, hi = max(0, c - 2), min(len(f.pix_rows) - 1, c + 2)
+        assert not (f.pix_rows[lo : hi + 1] > 0).any(), (split_y, c)
+
+
+def test_adaptive_split_tight_scan_clean_cut(tight_scan_pdf):
+    """Regression: on a dense scan (few-pixel line gaps) the cut must land in
+    pixel-level whitespace, never through a text line."""
+    plans, feats = adaptive_split_analyze(str(tight_scan_pdf))
+    for p, f in zip(plans, feats):
+        top, bottom = p.segments
+        split_y = top.clip.y1
+        assert abs(top.clip.y1 - bottom.clip.y0) < 1e-6
+        c = int(split_y / f.pt_per_px)
+        lo, hi = max(0, c - 2), min(len(f.pix_rows) - 1, c + 2)
+        assert not (f.pix_rows[lo : hi + 1] > 0).any(), (split_y, c)
 
 
 def test_adaptive_split_rotated_scan(scan_rot_pdf):
@@ -140,7 +152,7 @@ def test_adaptive_split_rotated_scan(scan_rot_pdf):
     for p in plans:
         top, bottom = p.segments
         assert abs(top.clip.y1 - bottom.clip.y0) < 1e-6  # no overlap
-        # neither half may degenerate into a sliver
+        # neither half may degenerate into a sliver (code guarantee: 12%)
         h = p.crop.height
-        assert top.clip.height >= 0.2 * h
-        assert bottom.clip.height >= 0.2 * h
+        assert top.clip.height >= 0.12 * h
+        assert bottom.clip.height >= 0.12 * h

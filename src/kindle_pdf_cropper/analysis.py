@@ -148,6 +148,8 @@ def _page_features(
     if ink.mean() > 0.6:  # dark-background page (negative scan): flip
         ink = ~ink
 
+    pix_rows = ink.sum(axis=1).astype(np.int32)
+
     h, w = ink.shape
     block = max(1, min(8, min(h, w) // 4))
     hb, wb = h // block, w // block
@@ -226,6 +228,7 @@ def _page_features(
         block=block,
         row_sums=row_sums,
         col_sums=col_sums,
+        pix_rows=pix_rows,
         lines=lines,
         text_chars=text_chars,
         image_area=image_area,
@@ -241,18 +244,90 @@ def _page_features(
 # --------------------------------------------------------------------------
 
 
+def _repeated_strip_signatures(
+    feats_list: list[PageFeatures], zone: float
+) -> set[int]:
+    """Return the set of page indices whose top band signature repeats on at
+    least ~10% of the pages.
+
+    Running headers in scanned books have no text layer, but the *band
+    itself* (the small topmost ink group) carries the same glyph pattern on
+    every page that shows the same header -- even when the header sits
+    exactly one line-gap above the body (where the geometric gap test fails)
+    or at slightly different vertical positions.  The signature is computed
+    on the band region aligned to its own top, so position differences do
+    not matter.
+    """
+    from collections import Counter
+
+    n = len(feats_list)
+    if n == 0:
+        return set()
+    # running headers in scans change per chapter/section, so clusters can be
+    # small -- 2% of the pages (>= 3 pages) is enough evidence
+    min_count = max(3, math.ceil(0.02 * n))
+    sigs: dict[int, bytes | None] = {}
+    for feats in feats_list:
+        hb, wb = feats.ink.shape
+        zone_blk = max(1, int(zone * hb))
+        active = feats.row_sums >= max(2, int(0.0015 * wb))
+        fine = _row_groups(active, 1)
+        sig = None
+        if fine:
+            g = fine[0]
+            band_h = g[1] - g[0] + 1
+            if (
+                g[0] <= zone_blk
+                and band_h <= max(6, int(0.05 * hb))
+            ):
+                r0 = max(0, g[0] - 1)
+                r1 = min(hb - 1, g[1] + 1)
+                region = feats.ink[r0 : r1 + 1, :]
+                # normalize height/width to a fixed 16x8 grid so bands of
+                # slightly different height still produce equal signatures
+                rows_idx = np.linspace(0, region.shape[0] - 1, 16).astype(int)
+                cols_idx = np.linspace(0, region.shape[1] - 1, 8).astype(int)
+                grid = region[np.ix_(rows_idx, cols_idx)]
+                sig = grid.tobytes()
+        sigs[feats.index] = sig
+    counts = Counter(sigs.values())
+    repeated = {
+        idx for idx, s in sigs.items() if s is not None and counts[s] >= min_count
+    }
+    return repeated
+
+
 def _detect_band(
     feats: PageFeatures,
     zone_sign: int,
     zone: float,
     repeat_keys: set[str],
     gap_factor: float,
+    rep_top: bool = False,
 ) -> tuple[float | None, float | None]:
     """Detect a header (sign=-1) or footer (sign=+1) band.
 
     Returns ``(removed_start_pt, removed_end_pt)`` -- the vertical extent of
     the band that should be cropped away -- or ``(None, None)`` when nothing
     qualifies.
+
+    Geometric signal (works for scans): the topmost / bottommost ink group is
+    treated as a header / footer band when it is *small* and either
+
+    * ``rep_top`` -- the page's top strip matches a strip repeated across
+      many pages (cross-page running-header detection, robust against
+      tight layouts where the header sits exactly one line-gap above the
+      body), or
+    * it is separated from the body by a gap clearly wider than the median
+      line gap, or
+    * it is a small, low-coverage (centered) band very close to the page
+      edge (fallback for tight layouts without repetition).
+
+    A *footer* additionally requires a separation gap wider than the median
+    line gap (so the last body line on a short page is never eaten).
+
+    Textual signal: repeated running header/footer text lines and
+    page-number-like lines (born-digital PDFs).
     """
     if feats.blank:
         return None, None
@@ -262,67 +337,67 @@ def _detect_band(
     pt_per_px = feats.pt_per_px
     zone_blk = max(1, int(zone * hb))
 
-    # --- geometric signal: isolated small band separated by a clear gap ----
+    # --- geometric signal ------------------------------------------------
     active = feats.row_sums >= max(2, int(0.0015 * wb))
     any_ink = feats.row_sums > 0
-    merge = max(1, int(0.012 * hb))
-    groups = _row_groups(active, merge)
+    fine = _row_groups(active, 1)
+    gaps = (
+        [fine[i + 1][0] - fine[i][1] - 1 for i in range(len(fine) - 1)]
+        if len(fine) > 1
+        else []
+    )
+    line_gap = float(np.median(gaps)) if gaps else 1.0
+    block_pt = feats.block * pt_per_px
+    ref_gap_blk = (
+        (feats._line_gap_pt or (line_gap * block_pt)) / block_pt
+        if block_pt
+        else line_gap
+    )
+    # typical *line* height: median height of line-like groups only (a giant
+    # body block must not inflate it, or everything would look "small")
+    line_hs = [g[1] - g[0] + 1 for g in fine if (g[1] - g[0] + 1) <= max(8, int(0.03 * hb))]
+    line_h = float(np.median(line_hs)) if line_hs else 1.0
+    small_band = max(4, int(0.06 * hb), int(2.5 * line_h))
     geom: float | None = None
-    if groups:
+    if fine:
         if zone_sign < 0:
-            g = groups[0]
-            if len(groups) > 1:
-                body_gaps = [
-                    groups[i + 1][0] - groups[i][1] - 1
-                    for i in range(1, len(groups) - 1)
-                ]
-                gap = groups[1][0] - g[1] - 1
-                median_body = (
-                    float(np.median(body_gaps)) if body_gaps else 0.0
-                )
-                gap_min = max(merge * 2, int(0.012 * hb))
-                if (
-                    g[0] <= zone_blk
-                    and (g[1] - g[0] + 1) <= int(0.07 * hb)
-                    and gap > max(gap_min, median_body + 1)
-                ):
-                    # grow the band over faint glyph edges (thin ascenders
-                    # may not pass the row-density threshold)
+            g = fine[0]
+            if (
+                g[0] <= zone_blk
+                and (g[1] - g[0] + 1) <= small_band
+            ):
+                sep_gap = fine[1][0] - g[1] - 1 if len(fine) > 1 else 0
+                band = feats.ink[g[0] : g[1] + 1, :]
+                coverage = (band.sum(axis=0) > 0).mean()
+                centered = coverage <= 0.5 and g[0] <= int(0.08 * hb)
+                if rep_top or sep_gap > ref_gap_blk + 0.5 or centered:
                     end = g[1]
                     grow_cap = max(2, int(0.015 * hb))
                     grown = 0
                     while (
-                        end + 1 < hb
-                        and any_ink[end + 1]
-                        and grown < grow_cap
+                        end + 1 < hb and any_ink[end + 1] and grown < grow_cap
                     ):
                         end += 1
                         grown += 1
                     geom = (end + 1) * feats.block * pt_per_px
         else:
-            g = groups[-1]
-            if len(groups) > 1:
-                body_gaps = [
-                    groups[i + 1][0] - groups[i][1] - 1
-                    for i in range(0, len(groups) - 2)
-                ]
-                gap = g[0] - groups[-2][1] - 1
-                median_body = (
-                    float(np.median(body_gaps)) if body_gaps else 0.0
-                )
-                gap_min = max(merge * 2, int(0.012 * hb))
-                if (
-                    g[1] >= hb - zone_blk - 1
-                    and (g[1] - g[0] + 1) <= int(0.07 * hb)
-                    and gap > max(gap_min, median_body + 1)
-                ):
+            g = fine[-1]
+            # footer must be a *small, narrow* band (page number etc.),
+            # not a full-width paragraph that happens to end the page
+            small_footer = max(3, int(0.025 * hb), int(1.5 * line_h))
+            if (
+                g[1] >= hb - zone_blk - 1
+                and (g[1] - g[0] + 1) <= small_footer
+            ):
+                band = feats.ink[g[0] : g[1] + 1, :]
+                coverage = (band.sum(axis=0) > 0).mean()
+                prev_gap = g[0] - fine[-2][1] - 1 if len(fine) > 1 else 0
+                if prev_gap > ref_gap_blk + 0.5 and coverage <= 0.7:
                     start = g[0]
                     grow_cap = max(2, int(0.015 * hb))
                     grown = 0
                     while (
-                        start - 1 >= 0
-                        and any_ink[start - 1]
-                        and grown < grow_cap
+                        start - 1 >= 0 and any_ink[start - 1] and grown < grow_cap
                     ):
                         start -= 1
                         grown += 1
@@ -463,10 +538,12 @@ def _crop_rect(feats: PageFeatures, config: Config) -> fitz.Rect:
     bot_start: float | None = None
     if config.header_footer_zone > 0:
         _, top_end = _detect_band(
-            feats, -1, zone, feats._repeat_top, config.hf_gap_factor
+            feats, -1, zone, feats._repeat_top, config.hf_gap_factor,
+            rep_top=feats._rep_top,
         )
         bot_start, _ = _detect_band(
-            feats, +1, zone, feats._repeat_bottom, config.hf_gap_factor
+            feats, +1, zone, feats._repeat_bottom, config.hf_gap_factor,
+            rep_top=feats._rep_top,
         )
         total_trim = (top_end or 0.0) + (
             feats.height - (bot_start or feats.height)
@@ -522,9 +599,36 @@ def analyze_document(
                 counters[-1][ln.norm_text] += 1
             elif ln.vfrac > 1.0 - zone and not _is_page_number(ln):
                 counters[+1][ln.norm_text] += 1
+
+    # cross-page top-strip repetition for scanned pages (running headers in
+    # scans have no text layer; the strip signature clusters identical pages)
+    rep_sigs = _repeated_strip_signatures(feats_list, zone)
+
+    # document-level reference line gap (pt): the header/footer separation
+    # gap must be compared against a typical *line* gap, not against the
+    # single gap of a page that happens to contain only two ink groups
+    line_gaps_pt = []
+    for feats in feats_list:
+        hb, wb = feats.ink.shape
+        active = feats.row_sums >= max(2, int(0.0015 * wb))
+        fine = _row_groups(active, 1)
+        if len(fine) > 1:
+            gaps = [
+                fine[i + 1][0] - fine[i][1] - 1
+                for i in range(len(fine) - 1)
+            ]
+            line_gaps_pt.append(
+                float(np.median(gaps)) * feats.block * feats.pt_per_px
+            )
+    global_line_gap = (
+        float(np.median(line_gaps_pt)) if line_gaps_pt else None
+    )
+
     for feats in feats_list:
         feats._repeat_top = {k for k, c in counters[-1].items() if c >= min_pages}
         feats._repeat_bottom = {k for k, c in counters[+1].items() if c >= min_pages}
+        feats._rep_top = feats.index in rep_sigs
+        feats._line_gap_pt = global_line_gap
         feats._band_top_end = None
         feats._band_bot_start = None
 
@@ -588,20 +692,26 @@ def _make_segments(
 def _adaptive_split_y(feats: PageFeatures, crop: fitz.Rect) -> float:
     """Choose the best horizontal cut position inside `crop`.
 
-    The goal is to place the cut in the *blank space between two lines*
-    (two text baselines), so no glyph row is cut and the two halves need no
+    The goal is to place the cut in the *blank space between two lines* (two
+    text baselines), so no glyph row is cut and the two halves need no
     overlap.  Candidates are (in priority order):
 
     1. text-based: the gap between two consecutive text line boxes
        (exact for born-digital PDFs);
-    2. raster-based: runs of ink-free rows in the block projection
-       (works for scanned PDFs, rotated pages and any page).
+    2. raster-based: runs of ink-free rows in the *per-pixel* row projection,
+       with a small pure-whitespace clearance around the cut (tightly typeset
+       scans have only a few pixels of inter-line whitespace, invisible at
+       block resolution).
 
-    The candidate whose centre is closest to the crop's vertical middle wins;
-    wider gaps are preferred on ties.
+    Candidates whose *neighbouring ink regions are both solid blocks* are
+    treated as gaps *inside* a figure / large formula and are only used as a
+    last resort (so images are not cut when a text gap exists anywhere).
+    The candidate closest to the crop's vertical middle wins; wider gaps are
+    preferred on ties.  If nothing qualifies, the vertical middle is used.
     """
     mid = (crop.y0 + crop.y1) / 2.0
-    candidates: list[tuple[float, float, float]] = []  # (|d-mid|, -width, y)
+    # candidate tuple: (inside_figure, distance_to_mid, -width, y)
+    candidates: list[tuple[int, float, float, float]] = []
 
     # --- 1) text line gaps (text pages, unrotated) -------------------------
     if feats.lines and not feats.had_rotation:
@@ -623,56 +733,118 @@ def _adaptive_split_y(feats: PageFeatures, crop: fitz.Rect) -> float:
             w = gap_bot - gap_top
             if w >= min_gap:
                 y = (gap_top + gap_bot) / 2.0
-                candidates.append((abs(y - mid), -w, y))
+                candidates.append((0, abs(y - mid), -w, y))
 
     # --- 2) raster blank bands (scans, rotated pages, any page) ------------
-    hb, wb = feats.ink.shape
-    block = feats.block
+    # Per-PIXEL row projection: inter-line whitespace in tightly typeset
+    # scans is only a few pixels tall; block-level (8 px) rows are polluted
+    # by the neighbouring lines and cannot resolve it.
+    pix = feats.pix_rows
     ptpp = feats.pt_per_px
-    thr = max(2, int(0.0015 * wb))
-    active = feats.row_sums >= thr
-    y0_blk = max(0, int(math.floor(crop.y0 / ptpp / block)))
-    y1_blk = min(hb - 1, int(math.ceil(crop.y1 / ptpp / block)))
-    if y1_blk > y0_blk:
-        band = active[y0_blk : y1_blk + 1]
-        # reference gap width = median spacing between active row groups
-        groups = _row_groups(band, 1)
+    W_px = feats.ink.shape[1] * feats.block
+    pix_thr = max(1, int(0.0002 * W_px))
+    blank = pix <= pix_thr
+    y0_px = max(0, int(math.floor(crop.y0 / ptpp)))
+    y1_px = min(len(pix) - 1, int(math.ceil(crop.y1 / ptpp)))
+    if y1_px > y0_px:
+        band = blank[y0_px : y1_px + 1]
+
+        # typical gap width = median blank-run width between active groups
+        groups = _row_groups(pix[y0_px : y1_px + 1] > pix_thr, 1)
         gaps = [
             groups[i + 1][0] - groups[i][1] - 1
             for i in range(len(groups) - 1)
         ]
-        median_gap = float(np.median(gaps)) if gaps else 1.0
-        min_gap_blk = max(1, int(round(0.5 * median_gap)))
-        # runs of ink-free rows
+        median_gap = float(np.median(gaps)) if gaps else 4.0
+        min_gap_px = max(2, int(round(0.5 * median_gap)))
+
+        # solid-block detector (figure / big formula / table block)
+        def _solid(start_px: int, end_px: int) -> bool:
+            if end_px < start_px:
+                return True
+            rows = pix[start_px : end_px + 1]
+            return bool((rows > pix_thr).mean() > 0.85) and (
+                end_px - start_px
+            ) >= 6 * feats.block
+
         run_start = None
+        band_len = y1_px - y0_px + 1
         for i, a in enumerate(band):
-            if not a:
+            if a:
                 if run_start is None:
                     run_start = i
             elif run_start is not None:
-                w = i - run_start
-                if w >= min_gap_blk:
-                    y = (
-                        (y0_blk + run_start) + (y0_blk + i) - 1
-                    ) / 2.0 * block * ptpp
-                    candidates.append((abs(y - mid), -w * block * ptpp, y))
+                _emit_run(feats, mid, y0_px, run_start, i - 1,
+                          min_gap_px, pix_thr, band_len, _solid, candidates)
                 run_start = None
         if run_start is not None:
-            w = len(band) - run_start
-            if w >= min_gap_blk:
-                y = (y0_blk + run_start + y0_blk + y1_blk) / 2.0 * block * ptpp
-                candidates.append((abs(y - mid), -w * block * ptpp, y))
+            _emit_run(feats, mid, y0_px, run_start, band_len - 1,
+                      min_gap_px, pix_thr, band_len, _solid, candidates)
 
-    if not candidates:
-        return mid
-    # only consider gaps reasonably close to the vertical middle, so the two
-    # halves stay balanced (rotated scans with vertical text have almost no
-    # horizontal blank bands -- fall back to a plain middle cut then)
-    window = 0.25 * (crop.y1 - crop.y0)
-    near = [c for c in candidates if c[0] <= window]
-    if not near:
-        return mid
-    return min(near)[2]
+    # pick the best candidate that keeps both halves reasonable
+    min_share = 0.12 * (crop.y1 - crop.y0)
+    best = None
+    for cand in sorted(candidates):
+        y = cand[3]
+        if (y - crop.y0) >= min_share and (crop.y1 - y) >= min_share:
+            best = y
+            break
+    return best if best is not None else mid
+
+
+def _emit_run(
+    feats: PageFeatures,
+    mid: float,
+    y0: int,
+    run_start: int,
+    run_end: int,
+    min_gap: int,
+    thr: int,
+    band_len: int,
+    solid,
+    candidates: list,
+) -> None:
+    """Record one ink-free row run as a split candidate."""
+    if run_start == 0 or run_end >= band_len - 1:
+        # margin whitespace touching the crop edge: not a line gap
+        return
+    w = run_end - run_start + 1
+    if w < min_gap:
+        return
+    start_abs, end_abs = y0 + run_start, y0 + run_end
+    center = int((start_abs + end_abs) / 2)
+    # the cut row and its immediate neighbours must be ink-free, so the cut
+    # line passes through pure whitespace with a small clearance
+    lo, hi = max(0, center - 1), min(len(feats.pix_rows) - 1, center + 1)
+    if (feats.pix_rows[lo : hi + 1] > thr).any():
+        return
+    # figure/formula guard: a gap inside a solid ink block (both sides solid)
+    above = _run_bounds_above(feats, start_abs - 1, thr)
+    below = _run_bounds_below(feats, end_abs + 1, thr)
+    inside_figure = int(solid(*above) and solid(*below))
+    y = (center + 0.5) * feats.pt_per_px
+    candidates.append((inside_figure, abs(y - mid), -w * feats.pt_per_px, y))
+
+
+def _run_bounds_above(feats: PageFeatures, start: int, thr: int) -> tuple[int, int]:
+    """Contiguous ink-run extent ending at row `start` (inclusive)."""
+    if start < 0:
+        return 0, 0
+    end = start
+    while end >= 0 and feats.pix_rows[end] > thr:
+        end -= 1
+    return end + 1, start
+
+
+def _run_bounds_below(feats: PageFeatures, start: int, thr: int) -> tuple[int, int]:
+    """Contiguous ink-run extent starting at row `start` (inclusive)."""
+    h = len(feats.pix_rows)
+    if start >= h:
+        return h - 1, h - 1
+    beg = start
+    while beg < h and feats.pix_rows[beg] > thr:
+        beg += 1
+    return start, beg - 1
 
 
 # --------------------------------------------------------------------------

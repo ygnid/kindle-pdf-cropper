@@ -34,6 +34,7 @@ class PageFeatures:
     block: int  # analysis pixels per ink cell
     row_sums: "np.ndarray"  # int, one entry per ink row (blocks)
     col_sums: "np.ndarray"  # int, one entry per ink col (blocks)
+    pix_rows: "np.ndarray"  # int, per-pixel row ink counts (analysis px)
     lines: list[LineRecord] = field(default_factory=list)
     text_chars: int = 0
     image_area: float = 0.0
@@ -49,6 +50,8 @@ class PageFeatures:
     # internal analysis scratch (not part of the public model)
     _repeat_top: "set[str]" = None
     _repeat_bottom: "set[str]" = None
+    _rep_top: bool = False
+    _line_gap_pt: float | None = None
     _band_top_end: float | None = None
     _band_bot_start: float | None = None
 

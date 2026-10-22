@@ -16,8 +16,8 @@ class Config:
     #: antialiasing / glyph overhangs are never clipped.
     margin_padding_pt: float = 6.0
     #: Fraction of page height used as the "header/footer zone" that is
-    #: eligible for repeated-text / page-number detection.
-    header_footer_zone: float = 0.12
+    #: eligible for repeated-text / page-number / running-strip detection.
+    header_footer_zone: float = 0.20
     #: Minimum whitespace gap (relative to median line height) that must
     #: separate a header/footer band from the body before we crop it away.
     hf_gap_factor: float = 0.6

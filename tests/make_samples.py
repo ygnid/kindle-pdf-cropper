@@ -120,6 +120,46 @@ def make_scanned_pdf(path: str, pages: int = 3, rotate: int = 0) -> str:
     return path
 
 
+def _make_tight_scan_page(w: int, h: int, page_no: int) -> Image.Image:
+    """A book-like dense scan: centered running header sitting exactly one
+    line-gap above the body, tightly spaced text lines (like the real
+    Chinese math textbook regression case)."""
+    img = Image.new("L", (w, h), 248)
+    px = img.load()
+    rnd = random.Random(page_no * 311)
+    for _ in range(3000):
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        px[x, y] = 238 + rnd.randrange(10)
+    d = ImageDraw.Draw(img)
+    try:
+        f_header = ImageFont.load_default(size=30)
+        f_body = ImageFont.load_default(size=34)
+    except TypeError:  # very old Pillow
+        f_header = f_body = ImageFont.load_default()
+    # running header, centered, one line-gap above the body
+    d.text((w // 2 - 90, 80), f"Section {page_no}", fill=35, font=f_header)
+    # dense body lines: line pitch 52 px, ink height ~30 px -> 22 px gap
+    y = 210
+    for ln in range(14):
+        d.text((150, y), f"Text line number {ln} of the scanned body "
+                         f"with dense leading page {page_no}.", fill=45, font=f_body)
+        y += 52
+    return img
+
+
+def make_tight_scan_pdf(path: str, pages: int = 4) -> str:
+    doc = fitz.open()
+    for i in range(pages):
+        img = _make_tight_scan_page(1240, 1754, i + 1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        page = doc.new_page(width=PAGE_W, height=PAGE_H)
+        page.insert_image(fitz.Rect(0, 0, PAGE_W, PAGE_H), stream=buf.getvalue())
+    doc.save(path, garbage=4, deflate=True)
+    doc.close()
+    return path
+
+
 if __name__ == "__main__":
     import sys
 

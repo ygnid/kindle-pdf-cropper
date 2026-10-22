@@ -80,6 +80,18 @@ def test_no_header_footer_mode_only_trims_margins(text_pdf):
         assert plan.crop.height < plan.height
 
 
+def test_tight_scan_repeated_header_removed(tight_scan_pdf):
+    """Regression: book-like dense scan whose centered running header sits
+    exactly one line-gap above the body must still be removed (repetition-
+    based detection; the geometric gap test alone cannot tell them apart)."""
+    plans, feats = analyze(str(tight_scan_pdf))
+    assert sum(1 for p in plans if p.removed_top is not None) >= 2
+    for p in plans:
+        if p.removed_top is not None:
+            assert p.removed_top < p.crop.y0, p  # header band is gone
+            assert p.crop.y0 > 60, p
+
+
 def test_blank_page_is_left_alone(tmp_path):
     import pymupdf as fitz
 
