@@ -335,6 +335,10 @@ def _apply_watermark_removal(
         hh, ww = min(h, wm_pix.shape[0]), min(w, wm_pix.shape[1])
         wm[:hh, :ww] = wm_pix[:hh, :ww]
         content = ink & ~wm
+        # the pixel row profile is only used to find whitespace for the
+        # adaptive split -- always use the watermark-cleaned version so the
+        # cut line is found between text lines, never on a watermark stroke
+        feats.pix_rows = content.sum(axis=1).astype(np.int32)
         # A page whose content would shrink below a third of its original
         # ink is left untouched (guard against documents where the repeated
         # pattern is real content, e.g. a repeated table).
