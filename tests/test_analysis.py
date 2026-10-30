@@ -92,6 +92,21 @@ def test_tight_scan_repeated_header_removed(tight_scan_pdf):
             assert p.crop.y0 > 60, p
 
 
+def test_watermark_scan_header_and_footer_removed(watermark_scan_pdf):
+    """Regression: a light repeated watermark must not block header/footer
+    detection on scanned pages (cross-page pixel-median watermark removal)."""
+    plans, feats = analyze(str(watermark_scan_pdf))
+    # running header is gone
+    assert sum(1 for p in plans if p.removed_top is not None) >= 2
+    # footer page number is gone
+    assert sum(1 for p in plans if p.removed_bottom is not None) >= 2
+    # the watermark is excluded from the crop (content does not reach the
+    # very bottom edge where the watermark / footer strip sits)
+    for p in plans:
+        if p.removed_bottom is not None:
+            assert p.crop.y1 < p.height - 10, p
+
+
 def test_blank_page_is_left_alone(tmp_path):
     import pymupdf as fitz
 

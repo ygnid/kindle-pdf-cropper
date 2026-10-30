@@ -123,6 +123,15 @@ def _row_groups(active: np.ndarray, merge_gap: int) -> list[tuple[int, int]]:
 # --------------------------------------------------------------------------
 
 
+def _binarize(gray: np.ndarray) -> np.ndarray:
+    """Grayscale page -> binary ink mask (same rules as pass 1)."""
+    t = _threshold(gray)
+    ink = gray < t
+    if ink.mean() > 0.6:  # dark-background page (negative scan): flip
+        ink = ~ink
+    return ink
+
+
 def _page_features(
     page: fitz.Page, index: int, had_rotation: bool, config: Config
 ) -> PageFeatures:
@@ -143,10 +152,7 @@ def _page_features(
         dtype=np.uint8,
     )
 
-    t = _threshold(gray)
-    ink = gray < t
-    if ink.mean() > 0.6:  # dark-background page (negative scan): flip
-        ink = ~ink
+    ink = _binarize(gray)
 
     pix_rows = ink.sum(axis=1).astype(np.int32)
 
@@ -244,56 +250,194 @@ def _page_features(
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# watermark removal (scanned pages)
+# --------------------------------------------------------------------------
+
+
+def _compute_watermark_mask(
+    work: fitz.Document,
+    feats_list: list[PageFeatures],
+    config: Config,
+    sample_n: int = 40,
+) -> "np.ndarray | None":
+    """Build a pixel-level watermark mask from a spread page sample.
+
+    A watermark / running header / page furniture pixel is *consistently*
+    darker than paper on (almost) every page, while a text pixel is dark only
+    on the few pages where that exact glyph position is occupied -- so its
+    median gray across pages stays at the paper background value.
+
+    Returns a boolean mask (True = watermark pixel) or None when the document
+    is too small or has no obvious repeated pattern.
+    """
+    n = len(feats_list)
+    if n < 4:
+        return None
+    idxs = np.linspace(0, n - 1, min(sample_n, n)).astype(int)
+    dpi = config.analysis_dpi
+    grays: list[np.ndarray] = []
+    hmax = wmax = 0
+    for i in idxs:
+        pix = work[int(i)].get_pixmap(
+            dpi=dpi, colorspace=fitz.csGRAY, alpha=False
+        )
+        g = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width
+        )
+        grays.append(g)
+        hmax = max(hmax, g.shape[0])
+        wmax = max(wmax, g.shape[1])
+    stack = np.zeros((len(grays), hmax, wmax), dtype=np.uint8)
+    for si, g in enumerate(grays):
+        stack[si, : g.shape[0], : g.shape[1]] = g
+    med = np.median(stack, axis=0)
+    bg = float(np.median(med))  # paper background
+    mask = med < (bg - 8.0)
+    # no obvious watermark -> nearly-empty mask
+    if mask.mean() < 0.002:
+        return None
+    return mask
+
+
+def _apply_watermark_removal(
+    work: fitz.Document,
+    feats_list: list[PageFeatures],
+    wm_pix: "np.ndarray",
+    config: Config,
+) -> None:
+    """Subtract watermark pixels from each *scanned* page's ink data.
+
+    A page whose content would shrink below half its original ink is left
+    untouched (guard against documents where the repeated pattern is real
+    content, e.g. a repeated table).
+    """
+    dpi = config.analysis_dpi
+    for feats in feats_list:
+        if not feats.is_scanned:
+            continue
+        page = work[feats.index]
+        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY, alpha=False)
+        gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width
+        )
+        gray = np.asarray(
+            Image.fromarray(gray, mode="L").filter(
+                ImageFilter.MedianFilter(3)
+            ),
+            dtype=np.uint8,
+        )
+        ink = _binarize(gray)
+        h, w = ink.shape
+        # pages may render at slightly different pixel sizes; pad the global
+        # watermark mask to the page size
+        wm = np.zeros(ink.shape, dtype=bool)
+        hh, ww = min(h, wm_pix.shape[0]), min(w, wm_pix.shape[1])
+        wm[:hh, :ww] = wm_pix[:hh, :ww]
+        content = ink & ~wm
+        # A page whose content would shrink below a third of its original
+        # ink is left untouched (guard against documents where the repeated
+        # pattern is real content, e.g. a repeated table).
+        if content.sum() < 0.35 * ink.sum():
+            continue  # suspicious: keep the page as-is
+        block = feats.block
+        hb, wb = h // block, w // block
+        if hb < 1 or wb < 1:
+            continue
+        inkb = content[: hb * block, : wb * block].reshape(
+            hb, block, wb, block
+        ).any(axis=(1, 3))
+        feats.ink = inkb
+        feats.row_sums = inkb.sum(axis=1).astype(np.int32)
+        feats.col_sums = inkb.sum(axis=0).astype(np.int32)
+        feats.pix_rows = content.sum(axis=1).astype(np.int32)
+
+
+def _top_header_band(
+    feats: PageFeatures,
+    zone: float,
+    zone_blk: int,
+    small_band: int,
+) -> "tuple[int, int] | None":
+    """First line-like small ink band inside the top zone.
+
+    Prefers bands of at least 2 blocks in height (a text line) so that a
+    tiny repeated ornament sitting above the real running header does not
+    steal the header role."""
+    active = feats.row_sums >= max(2, int(0.0015 * feats.ink.shape[1]))
+    fine = _row_groups(active, 1)
+    line_like = None
+    first_small = None
+    for g in fine:
+        if g[0] > zone_blk:
+            break
+        h = g[1] - g[0] + 1
+        if h > small_band:
+            continue
+        if first_small is None:
+            first_small = g
+        if h >= 2 and line_like is None:
+            line_like = g
+    return line_like or first_small
+
+
+def _top_band_signature(
+    feats: PageFeatures, zone: float
+) -> bytes | None:
+    """16x8 normalized signature of a page's running-header candidate band,
+    aligned to the band itself so position and height differences do not
+    matter."""
+    hb, wb = feats.ink.shape
+    zone_blk = max(1, int(zone * hb))
+    small_band = max(6, int(0.05 * hb))
+    g = _top_header_band(feats, zone, zone_blk, small_band)
+    if g is None:
+        return None
+    r0 = max(0, g[0] - 1)
+    r1 = min(hb - 1, g[1] + 1)
+    region = feats.ink[r0 : r1 + 1, :]
+    rows_idx = np.linspace(0, region.shape[0] - 1, 16).astype(int)
+    cols_idx = np.linspace(0, region.shape[1] - 1, 8).astype(int)
+    return region[np.ix_(rows_idx, cols_idx)].tobytes()
+
+
 def _repeated_strip_signatures(
     feats_list: list[PageFeatures], zone: float
 ) -> set[int]:
-    """Return the set of page indices whose top band signature repeats on at
-    least ~10% of the pages.
+    """Return the set of page indices whose top band is a *running header*.
 
-    Running headers in scanned books have no text layer, but the *band
-    itself* (the small topmost ink group) carries the same glyph pattern on
-    every page that shows the same header -- even when the header sits
-    exactly one line-gap above the body (where the geometric gap test fails)
-    or at slightly different vertical positions.  The signature is computed
-    on the band region aligned to its own top, so position differences do
-    not matter.
+    Two signals, either suffices:
+
+    1. clustering: the same band signature appears on >= max(3, 1%) pages;
+    2. adjacency: the signature is nearly identical (<= 25% differing bits)
+       on consecutive pages -- chapter/section headers repeat on every page
+       of the section, so even a 2-page section is caught.
     """
     from collections import Counter
 
     n = len(feats_list)
     if n == 0:
         return set()
-    # running headers in scans change per chapter/section, so clusters can be
-    # small -- 2% of the pages (>= 3 pages) is enough evidence
-    min_count = max(3, math.ceil(0.02 * n))
     sigs: dict[int, bytes | None] = {}
     for feats in feats_list:
-        hb, wb = feats.ink.shape
-        zone_blk = max(1, int(zone * hb))
-        active = feats.row_sums >= max(2, int(0.0015 * wb))
-        fine = _row_groups(active, 1)
-        sig = None
-        if fine:
-            g = fine[0]
-            band_h = g[1] - g[0] + 1
-            if (
-                g[0] <= zone_blk
-                and band_h <= max(6, int(0.05 * hb))
-            ):
-                r0 = max(0, g[0] - 1)
-                r1 = min(hb - 1, g[1] + 1)
-                region = feats.ink[r0 : r1 + 1, :]
-                # normalize height/width to a fixed 16x8 grid so bands of
-                # slightly different height still produce equal signatures
-                rows_idx = np.linspace(0, region.shape[0] - 1, 16).astype(int)
-                cols_idx = np.linspace(0, region.shape[1] - 1, 8).astype(int)
-                grid = region[np.ix_(rows_idx, cols_idx)]
-                sig = grid.tobytes()
-        sigs[feats.index] = sig
+        sigs[feats.index] = _top_band_signature(feats, zone)
+    repeated: set[int] = set()
+    # --- 1) clustering ------------------------------------------------
+    min_count = max(3, math.ceil(0.01 * n))
     counts = Counter(sigs.values())
-    repeated = {
-        idx for idx, s in sigs.items() if s is not None and counts[s] >= min_count
-    }
+    for idx, s in sigs.items():
+        if s is not None and counts[s] >= min_count:
+            repeated.add(idx)
+    # --- 2) adjacency ---------------------------------------------------
+    order = sorted(sigs)
+    for a, b in zip(order, order[1:]):
+        sa, sb = sigs[a], sigs[b]
+        if sa is None or sb is None:
+            continue
+        differing = sum(x != y for x, y in zip(sa, sb))
+        if differing <= 0.25 * len(sa):
+            repeated.add(a)
+            repeated.add(b)
     return repeated
 
 
@@ -361,15 +505,12 @@ def _detect_band(
     geom: float | None = None
     if fine:
         if zone_sign < 0:
-            g = fine[0]
-            if (
-                g[0] <= zone_blk
-                and (g[1] - g[0] + 1) <= small_band
-            ):
+            g = _top_header_band(feats, zone, zone_blk, small_band)
+            if g is not None:
                 sep_gap = fine[1][0] - g[1] - 1 if len(fine) > 1 else 0
                 band = feats.ink[g[0] : g[1] + 1, :]
                 coverage = (band.sum(axis=0) > 0).mean()
-                centered = coverage <= 0.5 and g[0] <= int(0.08 * hb)
+                centered = coverage <= 0.5 and g[0] <= int(0.13 * hb)
                 if rep_top or sep_gap > ref_gap_blk + 0.5 or centered:
                     end = g[1]
                     grow_cap = max(2, int(0.015 * hb))
@@ -587,6 +728,13 @@ def analyze_document(
     for pno in range(len(work)):
         had_rot = rotations[pno] != 0 if pno < len(rotations) else False
         feats_list.append(_page_features(work[pno], pno, had_rot, config))
+
+    # watermark / repeated-pattern removal (scanned books with a light
+    # diagonal watermark that confuses header/footer detection)
+    if config.remove_watermark:
+        wm_pix = _compute_watermark_mask(work, feats_list, config)
+        if wm_pix is not None:
+            _apply_watermark_removal(work, feats_list, wm_pix, config)
 
     # global repeated-running-header detection
     n = len(feats_list)

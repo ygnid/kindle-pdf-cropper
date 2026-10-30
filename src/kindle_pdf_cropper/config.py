@@ -26,6 +26,10 @@ class Config:
     repeat_min_share: float = 0.30
     #: Never crop away more than this share of the page height in total.
     max_trim_share: float = 0.25
+    #: Remove watermarks / repeated background patterns on scanned pages
+    #: (detected as pixels that are consistently darker than paper across
+    #: many pages, while real text pixels vary).
+    remove_watermark: bool = True
     #: Minimum fraction of a page *dimension* (width and height) that must
     #: remain after cropping; below that the page is kept as-is (protects
     #: against degenerate crops on nearly empty pages).

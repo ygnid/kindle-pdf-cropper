@@ -55,6 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable header/footer/page-number removal (only trim margins)",
     )
     p.add_argument(
+        "--no-watermark-removal", action="store_true",
+        help="disable watermark / repeated-pattern removal on scanned pages",
+    )
+    p.add_argument(
         "--epub-mode", choices=["image", "svg", "auto"], default="auto",
         help="EPUB page strategy: bitmap pages, SVG text/vector pages, or auto",
     )
@@ -91,7 +95,8 @@ def main(argv: list[str] | None = None) -> int:
             split=args.split,
             split_overlap_ratio=args.split_overlap_ratio,
             split_overlap_min_pt=args.split_overlap_pt,
-            header_footer_zone=0.0 if args.no_header_footer else 0.12,
+            header_footer_zone=0.0 if args.no_header_footer else 0.20,
+            remove_watermark=not args.no_watermark_removal,
             analysis_dpi=args.analysis_dpi,
             epub_dpi=args.epub_dpi,
             epub_image_format=args.epub_image_format,

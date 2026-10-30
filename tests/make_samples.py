@@ -160,6 +160,52 @@ def make_tight_scan_pdf(path: str, pages: int = 4) -> str:
     return path
 
 
+def _make_watermark_scan_page(w: int, h: int, page_no: int) -> Image.Image:
+    """Scan page with a light watermark strip over the footer area and a
+    separate page-number footer -- the regression case for watermark
+    removal (a light repeated pattern must not block header/footer
+    detection)."""
+    img = Image.new("L", (w, h), 248)
+    px = img.load()
+    rnd = random.Random(page_no * 977)
+    for _ in range(3000):
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        px[x, y] = 238 + rnd.randrange(10)
+    d = ImageDraw.Draw(img)
+    try:
+        f_header = ImageFont.load_default(size=30)
+        f_body = ImageFont.load_default(size=34)
+        f_wm = ImageFont.load_default(size=60)
+    except TypeError:  # very old Pillow
+        f_header = f_body = f_wm = ImageFont.load_default()
+    # running header (one line-gap above the body, repeated every page)
+    d.text((w // 2 - 90, 80), f"Section {page_no}", fill=35, font=f_header)
+    # body lines
+    y = 210
+    for ln in range(10):
+        d.text((150, y), f"Body text line {ln} of the watermarked page {page_no}.", fill=45, font=f_body)
+        y += 60
+    # light watermark strip sitting exactly where the footer lives
+    for yy in (h - 300, h - 190):
+        d.text((w // 2 - 220, yy), "WATERMARK", fill=205, font=f_wm)
+    # footer page number, separated from the body
+    d.text((w // 2 - 20, h - 160), f"{page_no}", fill=40, font=f_header)
+    return img
+
+
+def make_watermark_scan_pdf(path: str, pages: int = 5) -> str:
+    doc = fitz.open()
+    for i in range(pages):
+        img = _make_watermark_scan_page(1240, 1754, i + 1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        page = doc.new_page(width=PAGE_W, height=PAGE_H)
+        page.insert_image(fitz.Rect(0, 0, PAGE_W, PAGE_H), stream=buf.getvalue())
+    doc.save(path, garbage=4, deflate=True)
+    doc.close()
+    return path
+
+
 if __name__ == "__main__":
     import sys
 
