@@ -25,7 +25,9 @@ class Config:
     #: of the pages (running headers / footers).
     repeat_min_share: float = 0.30
     #: Never crop away more than this share of the page height in total.
-    max_trim_share: float = 0.25
+    #: Header + footer + their surrounding blank bands can legitimately add
+    #: up to ~1/3 of a sparse page, so keep this generous.
+    max_trim_share: float = 0.35
     #: Remove watermarks / repeated background patterns on scanned pages
     #: (detected as pixels that are consistently darker than paper across
     #: many pages, while real text pixels vary).

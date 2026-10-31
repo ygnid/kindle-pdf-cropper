@@ -53,26 +53,36 @@ def normalize_work_doc(src: fitz.Document) -> tuple[fitz.Document, list[int]]:
 
 
 def _threshold(gray: np.ndarray) -> int:
-    """Robust document binarization threshold.
+    """Robust *dark-ink* binarization threshold.
 
-    Finds the two dominant histogram modes -- the page background and the
-    darkest content mode -- and returns their midpoint.  This is far more
-    stable than plain Otsu for documents where a small but very dark cluster
-    (anti-aliased text cores) would otherwise dominate the between-class
-    variance.
+    Scanned pages frequently contain a large, fairly uniform light area: a
+    gray watermark, a scanner shadow, or the paper itself when the scan is
+    not pure white.  A plain two-mode midpoint (or Otsu) happily classifies
+    that area as ink, which both drowns the real text and makes the ink
+    projections useless.
+
+    Instead the threshold is anchored to the darkest printed strokes: take a
+    low percentile of the pixels that are clearly darker than the background
+    mode, then place the cut a fixed fraction of the way from that dark core
+    up towards the background.  Light watermarks sit far above the resulting
+    threshold and are ignored, while anti-aliased glyph edges (which always
+    have a dark core) are kept.
     """
     hist = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
     total = hist.sum()
     if total == 0:
         return 128
     bg = int(np.argmax(hist))
-    dark_hist = hist[:bg]
-    if dark_hist.sum() < 0.005 * total:
-        # no real dark content (blank / photo-only page): keep a mid default
-        return 128
-    dark = int(np.argmax(dark_hist))
-    t = int((bg + dark) / 2)
-    return max(30, min(245, t))
+    # pixels that are noticeably darker than the dominant (paper) mode
+    darker = gray[gray < bg - 6]
+    if darker.size < max(64, 0.002 * gray.size):
+        # no real dark content (blank / faint-only page): keep a mid default
+        return max(30, bg - 8)
+    dark = float(np.percentile(darker, 2))
+    t = bg - 0.40 * (bg - dark)
+    # never creep too close to the background, or paper noise turns to ink
+    t = min(t, bg - max(8.0, 0.08 * (bg - dark)))
+    return int(max(25, min(235, t)))
 
 
 _ROMAN = set("IVXLCDM")
@@ -165,6 +175,10 @@ def _page_features(
     inkb = ink[: hb * block, : wb * block].reshape(
         hb, block, wb, block
     ).any(axis=(1, 3))
+    # drop thin scan borders / shadows touching the paper edge; they are not
+    # content and must not become the "bottommost band" (which would hide a
+    # page number sitting above them)
+    inkb = _remove_border_blobs(inkb)
 
     row_sums = inkb.sum(axis=1).astype(np.int32)
     col_sums = inkb.sum(axis=0).astype(np.int32)
@@ -221,6 +235,9 @@ def _page_features(
 
     page_area = max(width * height, 1e-9)
     is_scanned = image_area >= 0.5 * page_area and text_chars < 300
+    # A full-page dark/full-bleed image (cover, photo plate) has no paper
+    # margins to find; cropping it to its dark ink would destroy the artwork.
+    photo_page = image_area >= 0.8 * page_area and float(np.median(gray)) < 160
 
     active_rows = row_sums >= max(2, int(config.min_run_ratio * wb))
     blank = not bool(active_rows.any()) and text_chars == 0
@@ -242,6 +259,7 @@ def _page_features(
         is_scanned=is_scanned,
         had_rotation=had_rotation,
         blank=blank,
+        photo_page=photo_page,
     )
 
 
@@ -261,15 +279,23 @@ def _compute_watermark_mask(
     config: Config,
     sample_n: int = 40,
 ) -> "np.ndarray | None":
-    """Build a pixel-level watermark mask from a spread page sample.
+    """Build a pixel-level watermark / repeated-furniture mask.
 
-    A watermark / running header / page furniture pixel is *consistently*
-    darker than paper on (almost) every page, while a text pixel is dark only
-    on the few pages where that exact glyph position is occupied -- so its
-    median gray across pages stays at the paper background value.
+    A watermark, running header, page frame or scanner artifact occupies the
+    *same* pixel on (almost) every page, so that pixel is darker than the
+    page paper on a large majority of the sampled pages.  Real body text sits
+    at a different place on each page (and even when the line grid repeats,
+    individual glyph strokes do not), so its darkness is not consistent.
 
-    Returns a boolean mask (True = watermark pixel) or None when the document
-    is too small or has no obvious repeated pattern.
+    Earlier versions used the cross-page *median* gray, which fails on dense
+    books: when text lines align across pages, more than half the sample can
+    be dark at a stroke pixel and the median wrongly reports a watermark,
+    erasing real text from the analysis.  Using the *fraction of pages that
+    are dark* at each pixel fixes this: only genuinely static marks reach a
+    high fraction, text stays scattered.
+
+    Returns a boolean mask (True = watermark / repeated mark) or None when
+    the document is too small or has no obvious repeated pattern.
     """
     n = len(feats_list)
     if n < 4:
@@ -288,12 +314,23 @@ def _compute_watermark_mask(
         grays.append(g)
         hmax = max(hmax, g.shape[0])
         wmax = max(wmax, g.shape[1])
-    stack = np.zeros((len(grays), hmax, wmax), dtype=np.uint8)
-    for si, g in enumerate(grays):
-        stack[si, : g.shape[0], : g.shape[1]] = g
-    med = np.median(stack, axis=0)
-    bg = float(np.median(med))  # paper background
-    mask = med < (bg - 8.0)
+
+    dark = np.zeros((hmax, wmax), dtype=np.uint32)
+    valid = np.zeros((hmax, wmax), dtype=np.uint32)
+    gsum = np.zeros((hmax, wmax), dtype=np.float64)
+    for g in grays:
+        h, w = g.shape
+        pbg = float(np.median(g))  # this page's paper level
+        d = g < (pbg - 8.0)
+        dark[:h, :w] += d
+        gsum[:h, :w] += g
+        valid[:h, :w] += 1
+
+    enough = valid >= max(3, int(0.5 * len(grays)))
+    frac = dark / np.maximum(valid, 1)
+    med = np.where(valid > 0, gsum / np.maximum(valid, 1), 255.0)
+    bg = float(np.median(med[valid > 0])) if np.any(valid > 0) else 255.0
+    mask = (frac >= 0.85) & (med < (bg - 8.0)) & enough
     # no obvious watermark -> nearly-empty mask
     if mask.mean() < 0.002:
         return None
@@ -306,11 +343,19 @@ def _apply_watermark_removal(
     wm_pix: "np.ndarray",
     config: Config,
 ) -> None:
-    """Subtract watermark pixels from each *scanned* page's ink data.
+    """Remove repeated watermark pixels from the per-pixel split profile.
 
-    A page whose content would shrink below half its original ink is left
-    untouched (guard against documents where the repeated pattern is real
-    content, e.g. a repeated table).
+    The *block* ink mask is deliberately left untouched.  It is already
+    thresholded to strong printed strokes, so a light watermark is absent
+    anyway; subtracting the repeated-pattern mask there would also erase the
+    running header / footer text (which is repeated by definition) before the
+    band detector gets a chance to see it.  The cleaned pixel row profile is
+    still useful for the adaptive split: watermark strokes must not be
+    mistaken for a line of text.
+
+    A page whose cleaned content would shrink below a third of its original
+    ink is left untouched (guard against documents where the repeated
+    pattern is real content, e.g. a repeated table).
     """
     dpi = config.analysis_dpi
     for feats in feats_list:
@@ -335,25 +380,8 @@ def _apply_watermark_removal(
         hh, ww = min(h, wm_pix.shape[0]), min(w, wm_pix.shape[1])
         wm[:hh, :ww] = wm_pix[:hh, :ww]
         content = ink & ~wm
-        # the pixel row profile is only used to find whitespace for the
-        # adaptive split -- always use the watermark-cleaned version so the
-        # cut line is found between text lines, never on a watermark stroke
-        feats.pix_rows = content.sum(axis=1).astype(np.int32)
-        # A page whose content would shrink below a third of its original
-        # ink is left untouched (guard against documents where the repeated
-        # pattern is real content, e.g. a repeated table).
         if content.sum() < 0.35 * ink.sum():
-            continue  # suspicious: keep the page as-is
-        block = feats.block
-        hb, wb = h // block, w // block
-        if hb < 1 or wb < 1:
-            continue
-        inkb = content[: hb * block, : wb * block].reshape(
-            hb, block, wb, block
-        ).any(axis=(1, 3))
-        feats.ink = inkb
-        feats.row_sums = inkb.sum(axis=1).astype(np.int32)
-        feats.col_sums = inkb.sum(axis=0).astype(np.int32)
+            continue  # suspicious: keep the page's original profile
         feats.pix_rows = content.sum(axis=1).astype(np.int32)
 
 
@@ -375,6 +403,10 @@ def _top_header_band(
     for g in fine:
         if g[0] > zone_blk:
             break
+        if g[0] <= 1:
+            # a band touching the paper edge is a scan border / shadow, not
+            # the running header; the real header sits further in
+            continue
         h = g[1] - g[0] + 1
         if h > small_band:
             continue
@@ -445,6 +477,55 @@ def _repeated_strip_signatures(
     return repeated
 
 
+def _repeated_footer_bands(
+    feats_list: list[PageFeatures], zone: float
+) -> set[int]:
+    """Return page indices whose bottom band is repeated page furniture.
+
+    Page numbers plus their tiny rule sit at almost the same height on page
+    after page, while body last-line positions vary with the amount of text.
+    A footer band is also much *narrower* than a body line (a short number /
+    rule rather than a full text measure).  Clustering the bottommost band by
+    normalised position, height and coverage catches footers even when the
+    gap above them is only one normal line gap -- the situation where a pure
+    "bigger than a line gap" test fails.
+    """
+    from collections import Counter
+
+    n = len(feats_list)
+    if n == 0:
+        return set()
+    keys: dict[int, tuple[int, int, bool]] = {}
+    counts: Counter = Counter()
+    for feats in feats_list:
+        if feats.blank or feats.photo_page or not feats.ink.any():
+            continue
+        hb, wb = feats.ink.shape
+        active = feats.row_sums >= max(2, int(0.0015 * wb))
+        groups = _row_groups(active, 1)
+        if not groups:
+            continue
+        g_top, g_bot = groups[-1]
+        zone_blk = max(1, int(zone * hb))
+        if g_bot < hb - zone_blk - 1:
+            continue
+        h = g_bot - g_top + 1
+        if h > max(8, int(0.08 * hb)):
+            continue
+        band = feats.ink[g_top : g_bot + 1, :]
+        coverage = float((band.sum(axis=0) > 0).mean())
+        # a body line normally covers most of the text measure; footer
+        # furniture (page number / short rule) is much narrower
+        if coverage > 0.55:
+            continue
+        vfrac = ((g_top + g_bot) / 2.0) / hb
+        key = (round(vfrac * 40), round(h * 100.0 / hb), coverage > 0.35)
+        keys[feats.index] = key
+        counts[key] += 1
+    min_count = max(3, math.ceil(0.03 * n))
+    return {i for i, k in keys.items() if counts[k] >= min_count}
+
+
 def _detect_band(
     feats: PageFeatures,
     zone_sign: int,
@@ -452,6 +533,7 @@ def _detect_band(
     repeat_keys: set[str],
     gap_factor: float,
     rep_top: bool = False,
+    rep_bottom: bool = False,
 ) -> tuple[float | None, float | None]:
     """Detect a header (sign=-1) or footer (sign=+1) band.
 
@@ -477,7 +559,7 @@ def _detect_band(
     Textual signal: repeated running header/footer text lines and
     page-number-like lines (born-digital PDFs).
     """
-    if feats.blank:
+    if feats.blank or feats.photo_page:
         return None, None
     height = feats.height
     hb = feats.ink.shape[0]
@@ -529,7 +611,7 @@ def _detect_band(
             g = fine[-1]
             # footer must be a *small, narrow* band (page number etc.),
             # not a full-width paragraph that happens to end the page
-            small_footer = max(3, int(0.025 * hb), int(1.5 * line_h))
+            small_footer = max(3, int(0.04 * hb), int(2.0 * line_h))
             if (
                 g[1] >= hb - zone_blk - 1
                 and (g[1] - g[0] + 1) <= small_footer
@@ -537,7 +619,15 @@ def _detect_band(
                 band = feats.ink[g[0] : g[1] + 1, :]
                 coverage = (band.sum(axis=0) > 0).mean()
                 prev_gap = g[0] - fine[-2][1] - 1 if len(fine) > 1 else 0
-                if prev_gap > ref_gap_blk + 0.5 and coverage <= 0.7:
+                # A repeated narrow bottom band is page furniture even when
+                # the gap above it is only one normal line gap (common when
+                # the page number sits directly under the last text line).
+                repeated_furniture = (
+                    rep_bottom and coverage <= 0.55 and prev_gap >= 1
+                )
+                if (
+                    prev_gap > ref_gap_blk + 0.5 or repeated_furniture
+                ) and coverage <= 0.7:
                     start = g[0]
                     grow_cap = max(2, int(0.015 * hb))
                     grown = 0
@@ -597,54 +687,158 @@ def _detect_band(
     return None, None
 
 
+def _binary_open(mask: np.ndarray, radius: int = 1) -> np.ndarray:
+    """Morphological opening (erode then dilate) on a boolean grid.
+
+    Implemented with numpy shifts so analysis keeps its numpy/Pillow-only
+    dependencies.  Used to delete tiny isolated specks -- dust, scanner
+    edge marks, watermark crumbs -- before measuring the content bounding
+    box.  Full text lines and figures (wider/taller than ``2*radius``)
+    survive untouched.
+    """
+    if radius <= 0 or not mask.any():
+        return mask
+
+    def shift(m: np.ndarray, dy: int, dx: int) -> np.ndarray:
+        h, w = m.shape
+        out = np.zeros_like(m)
+        ys0, ys1 = max(0, dy), min(h, h + dy)
+        xs0, xs1 = max(0, dx), min(w, w + dx)
+        yd0, yd1 = max(0, -dy), min(h, h - dy)
+        xd0, xd1 = max(0, -dx), min(w, w - dx)
+        out[ys0:ys1, xs0:xs1] = m[yd0:yd1, xd0:xd1]
+        return out
+
+    eroded = mask
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            eroded = eroded & shift(mask, dy, dx)
+    grown = eroded
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            grown = grown | shift(eroded, dy, dx)
+    return grown
+
+
+def _remove_border_blobs(
+    mask: np.ndarray,
+    max_area_share: float = 0.12,
+    max_thickness_share: float = 0.12,
+) -> np.ndarray:
+    """Drop thin blobs that touch the page boundary (scan borders / shadows).
+
+    Scanned books often carry a black strip along one or more paper edges.
+    The strip is connected to the page boundary and is thin, whereas real
+    content either does not touch the boundary or is a large full-bleed
+    image.  Any border-touching component that is both thin and small
+    relative to the total ink is therefore treated as an artifact.
+
+    A dark cover / full-page image forms one big component made of nearly
+    all the ink, so ``area <= max_area_share * total`` protects it.
+    """
+    h, w = mask.shape
+    total = int(mask.sum())
+    if total == 0:
+        return mask
+    seen = np.zeros((h, w), dtype=bool)
+    out = mask.copy()
+    max_thick_h = max(2, int(round(max_thickness_share * h)))
+    max_thick_w = max(2, int(round(max_thickness_share * w)))
+    ys, xs = np.nonzero(mask)
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if seen[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        seen[sy, sx] = True
+        cells: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            cells.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        ys_c = [c[0] for c in cells]
+        xs_c = [c[1] for c in cells]
+        y0, y1 = min(ys_c), max(ys_c)
+        x0, x1 = min(xs_c), max(xs_c)
+        touches_border = x0 == 0 or y0 == 0 or x1 == w - 1 or y1 == h - 1
+        if not touches_border:
+            continue
+        thin = (x1 - x0 + 1) <= max_thick_w or (y1 - y0 + 1) <= max_thick_h
+        if thin and len(cells) <= max_area_share * total:
+            for y, x in cells:
+                out[y, x] = False
+    return out
+
+
+def _mass_span(
+    mass: np.ndarray, total: int, trim: int
+) -> tuple[int | None, int | None]:
+    """Smallest [start, end] index range that contains ``total-2*trim`` of the
+    mass, with up to ``trim`` units discarded from each end.
+
+    Used to make the content box immune to small isolated marks: a few
+    hundred ink pixels at the page edge are far below ``trim`` and never
+    move the bound, while real body content is orders of magnitude heavier.
+    """
+    if total <= 0 or mass.size == 0:
+        return None, None
+    cum = np.cumsum(mass)
+    a = int(np.searchsorted(cum, trim, side="right"))
+    b = int(np.searchsorted(cum, total - trim, side="right")) - 1
+    if a > b:
+        peak = int(np.argmax(mass))
+        return peak, peak
+    a = max(0, min(a, mass.size - 1))
+    b = max(0, min(b, mass.size - 1))
+    return a, b
+
+
 def _body_bounds(
     feats: PageFeatures,
     top_end: float | None,
     bot_start: float | None,
 ) -> tuple[float, float, float, float]:
-    """(x0, y0, x1, y1) of visible body content in pt, from raster + text."""
-    hb, wb = feats.ink.shape
+    """(x0, y0, x1, y1) of visible body content in pt, from raster + text.
+
+    The raster box is measured on a lightly opened mask and with a small
+    mass trim, so an isolated speck / watermark crumb / edge scratch cannot
+    stretch the crop to the page edge (a very common failure on scans whose
+    paper edge carries a few dark pixels).
+    """
+    hb = feats.ink.shape[0]
     block = feats.block
     ptpp = feats.pt_per_px
     width, height = feats.width, feats.height
-    thr = max(2, int(0.0015 * wb))
-    active = feats.row_sums >= thr
 
-    def first_active_from(lo: int) -> int | None:
-        idx = np.argmax(active[lo:]) if active[lo:].any() else None
-        return lo + idx if idx is not None else None
-
-    def last_active_to(hi: int) -> int | None:
-        idxs = np.nonzero(active[: hi + 1])[0]
-        return int(idxs[-1]) if len(idxs) else None
-
+    lo = 0
+    hi = hb - 1
     if top_end is not None:
-        lo = max(0, int(math.ceil(top_end / ptpp / block)))
-        y0_blk = first_active_from(lo)
-    else:
-        y0_blk = int(np.argmax(active)) if active.any() else None
+        lo = min(hb - 1, max(0, int(math.ceil(top_end / ptpp / block))))
     if bot_start is not None:
-        hi = min(
-            hb - 1,
-            int(math.ceil(bot_start / ptpp / block)) - 1,
-        )
-        y1_blk = last_active_to(hi)
-    else:
-        y1_blk = hb - int(np.argmax(active[::-1])) - 1 if active.any() else None
-
-    if y0_blk is None or y1_blk is None or y1_blk < y0_blk:
+        hi = max(0, min(hb - 1, int(math.ceil(bot_start / ptpp / block)) - 1))
+    if hi < lo:
         return 0.0, 0.0, width, height
 
-    band = feats.ink[y0_blk : y1_blk + 1, :]
-    col_active = band.sum(axis=0) >= max(2, int(0.0015 * (y1_blk - y0_blk + 1)))
-    if not col_active.any():
+    sub = _binary_open(feats.ink[lo : hi + 1, :], 1)
+    sub = _remove_border_blobs(sub)
+    if not sub.any():
         return 0.0, 0.0, width, height
-    c0 = int(np.argmax(col_active))
-    c1 = wb - int(np.argmax(col_active[::-1]))
+
+    total = int(sub.sum())
+    # tiny trim only: the opening and border-blob filter already remove the
+    # usual specks, so this must never eat a real (even thin) text column
+    trim = max(1, min(int(round(0.001 * total)), 2))
+    r0, r1 = _mass_span(sub.sum(axis=1).astype(np.int64), total, trim)
+    c0, c1 = _mass_span(sub.sum(axis=0).astype(np.int64), total, trim)
+    if r0 is None or c0 is None:
+        return 0.0, 0.0, width, height
+
     x0 = c0 * block * ptpp
     x1 = (c1 + 1) * block * ptpp
-    y0 = y0_blk * block * ptpp
-    y1 = (y1_blk + 1) * block * ptpp
+    y0 = (lo + r0) * block * ptpp
+    y1 = (lo + r1 + 1) * block * ptpp
 
     # widen with text / image boxes so light or thin content is never clipped
     if not feats.had_rotation:
@@ -676,7 +870,7 @@ def _body_bounds(
 
 def _crop_rect(feats: PageFeatures, config: Config) -> fitz.Rect:
     """Final crop rectangle for one page."""
-    if feats.blank:
+    if feats.blank or feats.photo_page:
         return fitz.Rect(0, 0, feats.width, feats.height)
     zone = config.header_footer_zone
     top_end: float | None = None
@@ -688,7 +882,7 @@ def _crop_rect(feats: PageFeatures, config: Config) -> fitz.Rect:
         )
         bot_start, _ = _detect_band(
             feats, +1, zone, feats._repeat_bottom, config.hf_gap_factor,
-            rep_top=feats._rep_top,
+            rep_top=feats._rep_top, rep_bottom=feats._rep_bottom,
         )
         total_trim = (top_end or 0.0) + (
             feats.height - (bot_start or feats.height)
@@ -705,9 +899,18 @@ def _crop_rect(feats: PageFeatures, config: Config) -> fitz.Rect:
         min(feats.width, x1 + pad),
         min(feats.height, y1 + pad),
     )
-    if (
+    # `min_content_share` guards against a bogus near-empty crop.  But a page
+    # that genuinely holds only a few lines (section titles, notes pages)
+    # would be wrongly reset to the full page, leaving all its margins
+    # uncropped.  Only fall back when the analysis mask itself is nearly
+    # empty; a real sparse page keeps its (small) correct crop.
+    ink_share = (
+        feats.ink.sum() / feats.ink.size if feats.ink.size else 0.0
+    )
+    sparse = ink_share < 0.005
+    if sparse or (
         crop.width < config.min_content_share * feats.width
-        or crop.height < config.min_content_share * feats.height
+        and crop.height < config.min_content_share * feats.height
     ):
         # degenerate crop (nearly empty analysis): keep the page as-is
         crop = fitz.Rect(0, 0, feats.width, feats.height)
@@ -755,6 +958,9 @@ def analyze_document(
     # cross-page top-strip repetition for scanned pages (running headers in
     # scans have no text layer; the strip signature clusters identical pages)
     rep_sigs = _repeated_strip_signatures(feats_list, zone)
+    # cross-page bottom-band repetition (page number + rule sitting directly
+    # under the last body line, too close for a gap-only test)
+    rep_footers = _repeated_footer_bands(feats_list, zone)
 
     # document-level reference line gap (pt): the header/footer separation
     # gap must be compared against a typical *line* gap, not against the
@@ -780,6 +986,7 @@ def analyze_document(
         feats._repeat_top = {k for k, c in counters[-1].items() if c >= min_pages}
         feats._repeat_bottom = {k for k, c in counters[+1].items() if c >= min_pages}
         feats._rep_top = feats.index in rep_sigs
+        feats._rep_bottom = feats.index in rep_footers
         feats._line_gap_pt = global_line_gap
         feats._band_top_end = None
         feats._band_bot_start = None

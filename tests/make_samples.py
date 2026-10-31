@@ -206,6 +206,73 @@ def make_watermark_scan_pdf(path: str, pages: int = 5) -> str:
     return path
 
 
+def _make_furniture_scan_page(w: int, h: int, page_no: int) -> Image.Image:
+    """Dense scan with the real-world footer/edge problems:
+
+    * a light gray watermark block + text across the footer,
+    * a page number + rule sitting immediately under the last body line,
+    * a small dark mark on the left paper edge (survives a naive ink box).
+    """
+    img = Image.new("L", (w, h), 248)
+    px = img.load()
+    rnd = random.Random(page_no * 733)
+    for _ in range(3000):  # paper grain
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        px[x, y] = 238 + rnd.randrange(10)
+    d = ImageDraw.Draw(img)
+    try:
+        f_header = ImageFont.load_default(size=30)
+        f_body = ImageFont.load_default(size=34)
+        f_wm = ImageFont.load_default(size=70)
+    except TypeError:  # very old Pillow
+        f_header = f_body = f_wm = ImageFont.load_default()
+
+    # light repeated watermark occupying the footer area
+    d.rectangle([w * 0.18, h * 0.68, w * 0.62, h * 0.95], fill=232)
+    d.text((w * 0.24, h * 0.73), "WATERMARK", fill=205, font=f_wm)
+
+    # running header
+    d.text((w // 2 - 90, 80), f"Section {page_no}", fill=35, font=f_header)
+
+    # dense body lines reaching close to the footer
+    y = 210
+    for ln in range(21):
+        d.text(
+            (150, y),
+            f"Text line {ln} of the scanned body with dense leading "
+            f"page {page_no}.",
+            fill=45,
+            font=f_body,
+        )
+        y += 55
+
+    # page number + thin rule, only ~one short gap below the body
+    footer_y = y + 18
+    d.text((w // 2 - 20, footer_y), f"{page_no}", fill=40, font=f_header)
+    d.line(
+        [(w // 2 - 120, footer_y + 38), (w // 2 + 120, footer_y + 38)],
+        fill=40,
+        width=5,
+    )
+
+    # dark scan mark touching the left paper edge
+    d.rectangle([0, h * 0.45, 24, h * 0.52], fill=25)
+    return img
+
+
+def make_furniture_scan_pdf(path: str, pages: int = 5) -> str:
+    doc = fitz.open()
+    for i in range(pages):
+        img = _make_furniture_scan_page(1240, 1754, i + 1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        page = doc.new_page(width=PAGE_W, height=PAGE_H)
+        page.insert_image(fitz.Rect(0, 0, PAGE_W, PAGE_H), stream=buf.getvalue())
+    doc.save(path, garbage=4, deflate=True)
+    doc.close()
+    return path
+
+
 if __name__ == "__main__":
     import sys
 

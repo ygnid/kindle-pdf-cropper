@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 from make_samples import (  # noqa: E402
+    make_furniture_scan_pdf,
     make_scanned_pdf,
     make_text_pdf,
     make_tight_scan_pdf,
@@ -49,6 +50,13 @@ def tight_scan_pdf(tmp_path: Path) -> Path:
 def watermark_scan_pdf(tmp_path: Path) -> Path:
     p = tmp_path / "watermark_scan.pdf"
     make_watermark_scan_pdf(str(p), pages=5)
+    return p
+
+
+@pytest.fixture()
+def furniture_scan_pdf(tmp_path: Path) -> Path:
+    p = tmp_path / "furniture_scan.pdf"
+    make_furniture_scan_pdf(str(p), pages=5)
     return p
 
 

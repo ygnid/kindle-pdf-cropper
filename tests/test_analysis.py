@@ -61,11 +61,27 @@ def test_scanned_page_trims_margins_and_footer(scan_pdf):
 
 
 def test_rotated_page_keeps_content(scan_rot_pdf):
-    plans, _ = analyze(str(scan_rot_pdf))
-    p0 = plans[0]
-    # rotated page must not lose most of its content to a bogus band trim
-    kept = p0.crop.width * p0.crop.height / (p0.width * p0.height)
-    assert kept > 0.6, p0.crop
+    import numpy as np
+
+    from kindle_pdf_cropper.analysis import _binary_open, _remove_border_blobs
+
+    plans, feats = analyze(str(scan_rot_pdf))
+    p0, f0 = plans[0], feats[0]
+    # the crop must contain the page's real content: a rotated page may place
+    # its content in a sub-region of the displayed (landscape) page, so the
+    # correct behaviour is a *tight* crop around that content, not a bogus
+    # band trim that removes it.  Use the cleaned mask (specks/paper grain
+    # deliberately excluded) as the content reference.
+    content = _remove_border_blobs(_binary_open(f0.ink, 1))
+    ys, xs = np.nonzero(content)
+    assert xs.size
+    block_pt = f0.block * f0.pt_per_px
+    cx0, cx1 = xs.min() * block_pt, (xs.max() + 1) * block_pt
+    cy0, cy1 = ys.min() * block_pt, (ys.max() + 1) * block_pt
+    assert p0.crop.x0 <= cx0 + 1e-6
+    assert p0.crop.y0 <= cy0 + 1e-6
+    assert p0.crop.x1 >= cx1 - 1e-6
+    assert p0.crop.y1 >= cy1 - 1e-6
     # horizontal margins are trimmed
     assert p0.crop.x0 > 0 or p0.crop.x1 < p0.width
 
@@ -105,6 +121,18 @@ def test_watermark_scan_header_and_footer_removed(watermark_scan_pdf):
     for p in plans:
         if p.removed_bottom is not None:
             assert p.crop.y1 < p.height - 10, p
+
+
+def test_scan_edge_mark_and_close_footer_are_ignored(furniture_scan_pdf):
+    """Regression for real scanned books: a dark mark on the paper edge must
+    not keep a wide left margin, and a page number sitting directly under the
+    last body line (inside a light watermark) must still be removed."""
+    plans, _ = analyze(str(furniture_scan_pdf))
+    for plan in plans:
+        assert plan.crop.x0 > 20, plan.crop
+        assert plan.crop.y1 < plan.height * 0.82, plan.crop
+    assert sum(1 for p in plans if p.removed_top is not None) >= 4
+    assert sum(1 for p in plans if p.removed_bottom is not None) >= 4
 
 
 def test_blank_page_is_left_alone(tmp_path):

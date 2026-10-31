@@ -42,6 +42,8 @@ class PageFeatures:
     is_scanned: bool = False
     had_rotation: bool = False
     blank: bool = False
+    #: full-page dark image (book cover, photo plate): keep the page whole
+    photo_page: bool = False
 
     # filled by pass 2 -------------------------------------------------------
     crop: fitz.Rect | None = None
@@ -51,6 +53,7 @@ class PageFeatures:
     _repeat_top: "set[str]" = None
     _repeat_bottom: "set[str]" = None
     _rep_top: bool = False
+    _rep_bottom: bool = False
     _line_gap_pt: float | None = None
     _band_top_end: float | None = None
     _band_bot_start: float | None = None
