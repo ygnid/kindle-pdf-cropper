@@ -1010,6 +1010,28 @@ def analyze_document(
     return plans, feats_list
 
 
+def _limit_aspect(seg: Segment, max_ratio: float | None) -> Segment:
+    """Pad a segment left/right until height/width <= `max_ratio`.
+
+    The clip itself is never scaled or cropped; the extra width becomes blank
+    paper around it, so a Kindle in landscape can show the whole page at once.
+    """
+    if max_ratio is None or seg.width <= 0 or seg.height <= 0:
+        return seg
+    target_w = seg.height / max_ratio
+    if target_w <= seg.width + 1e-9:
+        return seg
+    extra = target_w - seg.width
+    pad_left = extra / 2.0
+    return Segment(
+        clip=seg.clip,
+        width=target_w,
+        height=seg.height,
+        pad_left=pad_left,
+        pad_right=extra - pad_left,
+    )
+
+
 def _make_segments(
     crop: fitz.Rect, config: Config, feats: PageFeatures | None = None
 ) -> list[Segment]:
@@ -1017,6 +1039,15 @@ def _make_segments(
         return Segment(
             clip=clip, width=abs(clip.width), height=abs(clip.height)
         )
+
+    def split_segments(clips: list[fitz.Rect]) -> list[Segment]:
+        result = []
+        for clip in clips:
+            s = seg(clip)
+            if config.split_max_aspect_ratio is not None:
+                s = _limit_aspect(s, config.split_max_aspect_ratio)
+            result.append(s)
+        return result
 
     if not config.split:
         return [seg(crop)]
@@ -1028,7 +1059,7 @@ def _make_segments(
     if overlap_mode:
         h = abs(crop.y1 - crop.y0)
         if h <= 2 * (config.split_overlap_min_pt or 0) + 2:
-            return [seg(crop)]
+            return split_segments([crop])
         overlap = max(
             (config.split_overlap_ratio or 0.0) * h,
             config.split_overlap_min_pt or 0.0,
@@ -1036,7 +1067,7 @@ def _make_segments(
         mid = (crop.y0 + crop.y1) / 2.0
         top = fitz.Rect(crop.x0, crop.y0, crop.x1, mid + overlap)
         bottom = fitz.Rect(crop.x0, mid - overlap, crop.x1, crop.y1)
-        return [seg(top), seg(bottom)]
+        return split_segments([top, bottom])
 
     # --- adaptive: cut in the whitespace between two lines ----------------
     split_y = _adaptive_split_y(feats, crop) if feats is not None else (
@@ -1045,7 +1076,7 @@ def _make_segments(
     split_y = max(crop.y0 + 1e-3, min(crop.y1 - 1e-3, split_y))
     top = fitz.Rect(crop.x0, crop.y0, crop.x1, split_y)
     bottom = fitz.Rect(crop.x0, split_y, crop.x1, crop.y1)
-    return [seg(top), seg(bottom)]
+    return split_segments([top, bottom])
 
 
 def _adaptive_split_y(feats: PageFeatures, crop: fitz.Rect) -> float:

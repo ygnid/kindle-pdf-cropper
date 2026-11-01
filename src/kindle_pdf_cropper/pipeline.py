@@ -33,7 +33,8 @@ def process(
     config = config.derived()
     out_dir = Path(out_dir) if out_dir else input_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = out_stem or (input_path.stem + "_cropped")
+    default_suffix = "_split" if config.split else "_cropped"
+    stem = out_stem or (input_path.stem + default_suffix)
 
     src = fitz.open(str(input_path))
     try:

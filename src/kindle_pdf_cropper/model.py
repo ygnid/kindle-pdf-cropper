@@ -66,6 +66,11 @@ class Segment:
     clip: fitz.Rect  # source-page rectangle (pt) shown on this output page
     width: float
     height: float
+    #: Blank margins added left/right so the page respects the maximum
+    #: height/width ratio (Kindle landscape fit).  The clip stays at its
+    #: original size; writers place it after `pad_left`.
+    pad_left: float = 0.0
+    pad_right: float = 0.0
 
 
 @dataclass

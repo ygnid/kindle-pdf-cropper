@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -92,3 +93,34 @@ def test_epub_image_mode_is_explicit(text_pdf, tmp_path):
         xhtml = z.read("pages/page-00001.xhtml").decode()
         assert "<svg" not in xhtml
         assert "<img" in xhtml
+
+
+def test_epub_split_aspect_ratio_pads_viewport(text_pdf, tmp_path):
+    out = tmp_path / "book.epub"
+    build_epub(
+        str(text_pdf), str(out),
+        split=True, split_max_aspect_ratio=0.1,
+    )
+    with zipfile.ZipFile(str(out)) as z:
+        xhtml = z.read("pages/page-00001.xhtml").decode()
+        m = re.search(r'content="width=(\d+),height=(\d+)"', xhtml)
+        assert m
+        w, h = int(m.group(1)), int(m.group(2))
+        assert h / w <= 0.1 + 0.01
+        assert "<svg" in xhtml
+
+
+def test_epub_scanned_split_aspect_ratio_pads_bitmap(scan_pdf, tmp_path):
+    out = tmp_path / "book.epub"
+    build_epub(
+        str(scan_pdf), str(out),
+        split=True, split_max_aspect_ratio=0.1,
+    )
+    with zipfile.ZipFile(str(out)) as z:
+        xhtml = z.read("pages/page-00001.xhtml").decode()
+        assert "<svg" not in xhtml
+        assert "<img" in xhtml
+        m = re.search(r'content="width=(\d+),height=(\d+)"', xhtml)
+        assert m
+        w, h = int(m.group(1)), int(m.group(2))
+        assert h / w <= 0.1 + 0.01

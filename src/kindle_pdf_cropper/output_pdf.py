@@ -30,7 +30,15 @@ def write_pdf(
         first = len(out)
         for seg in plan.segments:
             np_ = out.new_page(width=seg.width, height=seg.height)
-            np_.show_pdf_page(np_.rect, work, plan.index, clip=seg.clip)
+            # keep any aspect-ratio padding blank instead of stretching the
+            # source content across the wider page
+            content = fitz.Rect(
+                seg.pad_left,
+                0.0,
+                seg.pad_left + seg.clip.width,
+                seg.height,
+            )
+            np_.show_pdf_page(content, work, plan.index, clip=seg.clip)
         page_map[plan.index] = first + 1
 
     meta = {

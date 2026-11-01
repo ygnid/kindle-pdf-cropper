@@ -166,11 +166,53 @@ PDF 页面可能带 `/Rotate`（扫描件常见 90°/270°）。PyMuPDF 的 `get
 - 输出页宽 = 原页宽、页高 ≈ 原裁剪高的一半 → 天然横版（landscape），
   文字仍保持水平方向，Kindle 横屏时字号相当于翻倍。
 
+### 6.3 Kindle 屏幕比例限制（`--max-aspect-ratio` / `--device-type`）
+
+Kindle 横屏时屏幕尺寸为 `Hp × Wp`（`Wp × Hp` 是竖版分辨率），因此横版页面
+能在一屏内显示的条件是：
+
+```text
+page_height / page_width <= Wp / Hp
+```
+
+`Wp/Hp` 就是 `KINDLE_DEVICE_RATIOS` 中的值（3:4 屏为 0.75）。两个选项互斥：
+
+| `--device-type` | 竖版分辨率 | 最大高/宽比 |
+| --- | --- | --- |
+| `kindle` / `kindle-11` | 1072×1448 | 0.740 |
+| `kindle-10` | 600×800 | 0.750 |
+| `paperwhite-1` / `paperwhite-2` | 758×1024 | 0.740 |
+| `paperwhite-3` / `paperwhite-4` | 1072×1448 | 0.740 |
+| `paperwhite-5` | 1236×1648 | 0.750 |
+| `paperwhite-12` | 1264×1680 | 0.752 |
+| `voyage` / `oasis-1` | 1072×1448 | 0.740 |
+| `oasis-2` / `oasis-3` | 1264×1680 | 0.752 |
+| `scribe` | 1860×2480 | 0.750 |
+| `colorsoft` | 1264×1680 | 0.752 |
+| `dx` | 824×1200 | 0.687 |
+
+- `--max-aspect-ratio H/W`：直接给最大高/宽比，取值 `(0, 1]`；
+- `--device-type NAME`：按型号查上表；系列名（`paperwhite`/`oasis`）取该系列**最小**比例，
+  保证各代都能放下。
+- 两者都未指定且处于**交互式终端**（stdin/stdout 都是 TTY）时，`cli.py`
+  会用 ANSI 反显 + ↑/↓ 键弹出一个设备选择 TUI（含 "No limit" 与手动输入比例）；
+  管道/CI/测试等非 TTY 环境自动跳过。`--device-type none` 可显式表示不限制。
+- `--split` 时默认输出文件后缀为 `_split`（否则 `_cropped`），见 `pipeline.process`。
+
+超限时只增加页面宽度（`Segment.width = height / max_ratio`），左右各补
+`extra/2` 的空白，`Segment.clip` 不变。因此：
+
+- PDF：新页尺寸为补白后的 `Segment.width/height`，`show_pdf_page` 的目标矩形
+  从 `pad_left` 开始，空白侧不拉伸内容；
+- EPUB SVG：用补白后的页面尺寸生成 SVG，内容按 `pad_left` 放置；
+- EPUB 位图：先渲染 `clip`，再在左右用纸色画布补齐。
+
 ## 7. PDF 输出
 
-- 对每个输出段新建一页，尺寸 = 裁剪尺寸；
-- `show_pdf_page(page.rect, work, src_pno, clip=裁剪矩形)`：
-  把源页内容按裁剪区“物理复制”过来。因为是 Form XObject 引用，
+- 对每个输出段新建一页，尺寸 = 段尺寸（含屏幕比例补白）；
+- `show_pdf_page(content_rect, work, src_pno, clip=裁剪矩形)`：
+  把源页内容按裁剪区“物理复制”过来，`content_rect` 从 `seg.pad_left` 开始，
+  补白区域保持空白。因为是 Form XObject 引用，
   **文字仍是可选中的文字，矢量（表格线/公式路径）和嵌入字体原样保留，图片不重采样**；
 - 保留元数据；目录按 `源页 → 输出页` 映射重写。
 

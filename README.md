@@ -56,6 +56,8 @@ kindle-crop 书.pdf --debug-dir debug
 | `--split` | 关 | 每页上下切成两页横版 |
 | `--split-overlap-pt` | —（自适应） | 指定后启用"中线切分+重叠"：两页最小重叠（点） |
 | `--split-overlap-ratio` | —（自适应） | 指定后启用"中线切分+重叠"：重叠 = max(比例×裁剪高, 最小点数) |
+| `--max-aspect-ratio H/W` | — | `--split` 时每页最大高/宽比；超出时左右补白（如 `0.75` 对应 3:4 屏） |
+| `--device-type NAME` | — | `--split` 时按 Kindle 型号确定最大高/宽比；与上一项互斥；`none` 表示不限制，留空且为交互终端时弹出选择 TUI |
 | `--padding` | `6` | 内容框外保留的安全边距（点） |
 | `--no-header-footer` | 关 | 只裁边距，不删除页眉/页脚/页码 |
 | `--no-watermark-removal` | 关 | 关闭扫描页水印/重复图案的自动去除 |
@@ -64,7 +66,7 @@ kindle-crop 书.pdf --debug-dir debug
 | `--epub-image-format jpeg\|png` | `jpeg` | EPUB 位图格式 |
 | `--analysis-dpi` | `144` | 分析用渲染分辨率 |
 | `--debug-dir DIR` | — | 导出每页分析叠加图 |
-| `-o PATH` | 输入名+`_cropped` | 输出路径（`both` 时自动补 `.pdf`/`.epub`） |
+| `-o PATH` | 输入名+`_cropped`（`--split` 时为 `_split`） | 输出路径（`both` 时自动补 `.pdf`/`.epub`） |
 
 ## 自适应切分说明（--split）
 
@@ -83,6 +85,36 @@ kindle-crop 书.pdf --debug-dir debug
 
 指定 `--split-overlap-*` 后恢复旧模式：在中线切分，两页保留
 `max(比例×裁剪高, 最小点数)` 的重叠，保证中线附近的一行不会显示不全。
+
+## Kindle 屏幕比例限制（--max-aspect-ratio / --device-type）
+
+切分后的横版页面，如果**高/宽比**大于 Kindle 横屏的屏幕高/宽比
+（也就是竖版屏幕的宽/高比），Kindle 一屏放不下，需要翻两次才能看完一页。
+这两个选项用于给横版页面设置**最大高/宽比**，只对 `--split` 生效，且二者互斥：
+
+```bash
+# 按 Kindle 型号自动取屏幕比例（推荐）
+kindle-crop 书.pdf --split --device-type paperwhite-5 -o out/书_横版
+
+# 或手动指定最大高/宽比（0.75 即 3:4 屏）
+kindle-crop 书.pdf --split --max-aspect-ratio 0.75 -o out/书_横版
+```
+
+如果在**交互式终端**里使用 `--split`，但没有指定 `--device-type` 或
+`--max-aspect-ratio`，程序会弹出一个设备列表 TUI：用 ↑/↓ 移动、Enter 确认；
+选择 `No limit` 或按 `q` / `Esc` 则不限制。通过管道、重定向或 CI 运行时
+不会弹窗；非交互场景可显式使用 `--device-type none` 关闭限制。
+
+`--split` 时的默认输出文件名后缀为 `_split`（不切分时为 `_cropped`）。
+
+- 值表示**高 ÷ 宽**，横版页面取值应 ≤ 1；例如 3:4 屏为 `0.75`，16:10 屏为 `0.625`。
+- 超出限制的页面会在**左右两侧补白**，正文保持原比例居中，不拉伸、不重新排版；
+  PDF、SVG 和 EPUB 位图输出都会保留这些空白。
+- `--device-type` 支持常用 Kindle 型号/系列：
+  `kindle`、`kindle-10`、`kindle-11`、`paperwhite-1`…`paperwhite-5`、
+  `paperwhite-12`、`voyage`、`oasis-1`…`oasis-3`、`scribe`、`colorsoft`、`dx`。
+  系列名（如 `paperwhite`、`oasis`）取该系列最保守的比例，保证各代都能一屏显示。
+- 超过比例限制时才补白；本来就不高的页面不会被加宽。
 
 ## 水印 / 重复图案 / 页面污迹去除（扫描页自动）
 

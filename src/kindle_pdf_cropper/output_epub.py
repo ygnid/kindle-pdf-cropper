@@ -26,15 +26,22 @@ import pymupdf as fitz
 from PIL import Image
 
 from .config import Config
-from .model import PagePlan
+from .model import PagePlan, Segment
 
 log = logging.getLogger(__name__)
 
 
 def _render_image(
-    page: fitz.Page, clip: fitz.Rect, dpi: int, max_side: int
+    page: fitz.Page,
+    clip: fitz.Rect,
+    dpi: int,
+    max_side: int,
+    target_width_pt: float | None = None,
+    pad_left_pt: float = 0.0,
 ) -> Image.Image:
-    longest_pt = max(abs(clip.width), abs(clip.height))
+    clip_w = abs(clip.width)
+    target_w_pt = max(clip_w, target_width_pt or clip_w)
+    longest_pt = max(target_w_pt, abs(clip.height))
     dpi = min(dpi, int(max_side * 72.0 / longest_pt)) if longest_pt > 0 else dpi
     dpi = max(72, dpi)
     pix = page.get_pixmap(
@@ -46,22 +53,39 @@ def _render_image(
         ex = img.convert("RGB").getextrema()
         if ex[0] == ex[1] == ex[2]:
             img = img.convert("L")
+    # add blank side margins for the Kindle aspect-ratio limit
+    if target_w_pt > clip_w + 1e-6 and clip_w > 0:
+        scale = img.width / clip_w
+        pad_px = max(0, int(round(pad_left_pt * scale)))
+        target_px = max(
+            int(round(target_w_pt * scale)), pad_px + img.width
+        )
+        fill = 255 if img.mode == "L" else (255, 255, 255)
+        canvas = Image.new(img.mode, (target_px, img.height), fill)
+        canvas.paste(img, (min(pad_px, target_px - img.width), 0))
+        img = canvas
     return img
 
 
 def _segment_svg(
-    work: fitz.Document, plan: PagePlan, clip: fitz.Rect
+    work: fitz.Document, plan: PagePlan, seg: Segment
 ) -> tuple[str, float, float]:
     segdoc = fitz.open()
     try:
-        sp = segdoc.new_page(width=clip.width, height=clip.height)
-        sp.show_pdf_page(sp.rect, work, plan.index, clip=clip)
+        sp = segdoc.new_page(width=seg.width, height=seg.height)
+        content = fitz.Rect(
+            seg.pad_left,
+            0.0,
+            seg.pad_left + seg.clip.width,
+            seg.height,
+        )
+        sp.show_pdf_page(content, work, plan.index, clip=seg.clip)
         svg = sp.get_svg_image(text_as_path=False)
     finally:
         segdoc.close()
     # the root <svg> keeps its own user units (viewBox); CSS scales it to the
     # fixed-layout page box
-    return svg, abs(clip.width), abs(clip.height)
+    return svg, abs(seg.width), abs(seg.height)
 
 
 def write_epub(
@@ -91,7 +115,7 @@ def write_epub(
                 )
                 name = f"page-{len(pages) + 1:05d}"
                 if use_svg:
-                    svg, w, h = _segment_svg(work, plan, seg.clip)
+                    svg, w, h = _segment_svg(work, plan, seg)
                     pages.append(
                         {
                             "name": name,
@@ -103,7 +127,12 @@ def write_epub(
                     )
                 else:
                     img = _render_image(
-                        page, seg.clip, config.epub_dpi, config.epub_max_side
+                        page,
+                        seg.clip,
+                        config.epub_dpi,
+                        config.epub_max_side,
+                        target_width_pt=seg.width,
+                        pad_left_pt=seg.pad_left,
                     )
                     if config.epub_image_format == "png":
                         ext, media, save = "png", "image/png", {}

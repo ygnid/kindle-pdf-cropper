@@ -15,12 +15,14 @@
 - `config.py` is the single source of truth for knobs. `Config.derived()` validates and clamps values; call it before use. Add new CLI options by adding a `Config` field and mapping it in `cli.main`, not by hardcoding behavior in `analysis.py`.
 - `analysis.py` is raster-first: every page is rendered grayscale -> ink mask -> row/column projections, with text extraction supplying page-number/running-header signals. Two passes: per-page features, then document-level watermark/repetition detection, then final crop/split plans.
 - `model.py` defines `PageFeatures`, `PagePlan`, `Segment`. Output writers only consume `PagePlan.segments`; add a format by writing an `output_*.py` and wiring it into `pipeline.process` plus the CLI `--format` choices.
+- Default output stem is `<input>_cropped`, or `<input>_split` when `config.split` is set (`pipeline.process`). The CLI shows an interactive device picker for missing split aspect options only on a TTY; keep it out of non-interactive paths.
 
 ## Critical gotchas
 
 - Always call `normalize_work_doc(src)` before analysis. It bakes `/Rotate` into page content so text bboxes, raster pixels, and clip rects all share displayed-orientation coordinates. Never mix rects from `src` with rects from the normalized `work` doc.
 - `normalize_work_doc` returns a copy. Read metadata/TOC from the original `src` (as `pipeline.process` does), and close both documents.
 - Split default is adaptive: the cut goes into whitespace between lines (text bboxes first, else per-pixel blank bands), with no overlap. Overlap mode activates only when `split_overlap_ratio` or `split_overlap_min_pt` is set. Tests cover both modes; preserve the distinction.
+- Split aspect limiting is represented by `Segment.pad_left`/`pad_right` plus a wider `Segment.width`; writers must place the clip after `pad_left` instead of stretching it. `Config.derived()` resolves `device_type` into `split_max_aspect_ratio` and is idempotent when called again by `pipeline.process`.
 - PDF output creates new pages sized to the crop and uses `Page.show_pdf_page`, so text/vector content is preserved without rasterizing (not merely a CropBox change). EPUB is EPUB3 fixed-layout: `auto` means SVG for text pages and bitmaps for scans. Do not introduce reflow.
 - Light watermarks are removed by the strong-ink threshold itself; the cross-page repeated-pattern mask only cleans the per-pixel split profile. The block ink mask is intentionally left intact so repeated running headers/footers stay detectable as bands. Border-connected thin blobs and isolated specks are dropped separately in `analysis.py` (`_remove_border_blobs`, `_binary_open`).
 - `batch_crop.py` is a standalone local helper that shells out to `kindle-crop.exe`; it is not part of the installed package.

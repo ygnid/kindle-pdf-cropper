@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import pymupdf as fitz
+import pytest
 
 from kindle_pdf_cropper.analysis import analyze_document, normalize_work_doc
-from kindle_pdf_cropper.config import Config
+from kindle_pdf_cropper.config import Config, kindle_device_ratio
 from kindle_pdf_cropper.output_pdf import write_pdf
 
 OVERLAP_PT = 20.0
@@ -156,3 +157,94 @@ def test_adaptive_split_rotated_scan(scan_rot_pdf):
         h = p.crop.height
         assert top.clip.height >= 0.12 * h
         assert bottom.clip.height >= 0.12 * h
+
+
+def test_split_max_aspect_ratio_adds_side_padding(text_pdf):
+    plans, _ = adaptive_split_analyze(
+        str(text_pdf), split_max_aspect_ratio=0.1
+    )
+    padded = 0
+    for p in plans:
+        for seg in p.segments:
+            assert seg.height / seg.width <= 0.1 + 1e-6
+            if seg.width > seg.clip.width + 1e-6:
+                padded += 1
+                assert abs(seg.height / seg.width - 0.1) < 1e-6
+                assert seg.pad_left > 0 and seg.pad_right > 0
+                assert abs(
+                    seg.pad_left + seg.clip.width + seg.pad_right - seg.width
+                ) < 1e-6
+                assert seg.clip.height == seg.height
+    assert padded > 0
+
+
+def test_split_max_aspect_ratio_leaves_wide_pages_unchanged(text_pdf):
+    plans, _ = adaptive_split_analyze(
+        str(text_pdf), split_max_aspect_ratio=0.95
+    )
+    for p in plans:
+        for seg in p.segments:
+            assert seg.width == seg.clip.width
+            assert seg.pad_left == 0 and seg.pad_right == 0
+
+
+def test_device_type_derives_landscape_ratio():
+    c = Config(split=True, device_type="paperwhite-5").derived()
+    assert abs(c.split_max_aspect_ratio - 1236 / 1648) < 1e-12
+    # family aliases are conservative enough for every generation
+    alias = Config(split=True, device_type="paperwhite").derived()
+    assert alias.split_max_aspect_ratio <= 758 / 1024
+    assert kindle_device_ratio("kindle-paperwhite-5") == 1236 / 1648
+    assert kindle_device_ratio("Kindle Paperwhite") == 758 / 1024
+    assert kindle_device_ratio("amazon-kindle-oasis-3") == 1264 / 1680
+
+
+def test_aspect_ratio_options_are_validated():
+    with pytest.raises(ValueError):
+        Config(
+            split=True,
+            device_type="kindle",
+            split_max_aspect_ratio=0.75,
+        ).derived()
+    with pytest.raises(ValueError):
+        Config(device_type="kindle").derived()
+    with pytest.raises(ValueError):
+        Config(split=True, device_type="not-a-kindle").derived()
+    with pytest.raises(ValueError):
+        Config(split=True, split_max_aspect_ratio=1.5).derived()
+
+
+def test_device_type_none_means_no_limit():
+    c = Config(split=True, device_type="none").derived()
+    assert c.split_max_aspect_ratio is None
+
+
+def test_pdf_output_uses_padded_page_size(text_pdf, tmp_path):
+    plans, _ = adaptive_split_analyze(
+        str(text_pdf), split_max_aspect_ratio=0.1
+    )
+    out = tmp_path / "split-wide.pdf"
+    src = fitz.open(str(text_pdf))
+    try:
+        work, rotations = normalize_work_doc(src)
+        try:
+            write_pdf(work, plans, str(out))
+        finally:
+            work.close()
+    finally:
+        src.close()
+
+    doc = fitz.open(str(out))
+    try:
+        assert len(doc) == 10
+        for page, seg in zip(
+            doc, [s for p in plans for s in p.segments]
+        ):
+            assert abs(page.rect.width - seg.width) < 0.5
+            assert page.rect.height / page.rect.width <= 0.1 + 1e-3
+            if seg.width > seg.clip.width + 1e-6:
+                assert abs(page.rect.height / page.rect.width - 0.1) < 1e-3
+        # content still selectable, padding did not rasterize the page
+        assert "quick brown fox" in doc[0].get_text()
+    finally:
+        doc.close()

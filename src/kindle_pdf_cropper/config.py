@@ -9,6 +9,69 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+#: Kindle e-reader screen aspect ratios as *portrait width / portrait height*.
+#: A Kindle in landscape has height/width = portrait_width / portrait_height,
+#: so this is also the maximum height/width ratio for a split page that must
+#: fit on one screen.  Resolutions are the native panel resolutions published
+#: by Amazon (e.g. Paperwhite 5 1236x1648, Scribe 1860x2480).
+KINDLE_DEVICE_RATIOS: dict[str, float] = {
+    "kindle": 1072 / 1448,          # base Kindle 11th/12th gen (2022/2024)
+    "kindle-10": 600 / 800,         # base Kindle 10th gen (2019)
+    "kindle-11": 1072 / 1448,
+    "paperwhite-1": 758 / 1024,
+    "paperwhite-2": 758 / 1024,
+    "paperwhite-3": 1072 / 1448,
+    "paperwhite-4": 1072 / 1448,
+    "paperwhite-5": 1236 / 1648,    # 11th gen (2021)
+    "paperwhite-12": 1264 / 1680,   # 12th gen (2024)
+    "voyage": 1072 / 1448,
+    "oasis-1": 1072 / 1448,
+    "oasis-2": 1264 / 1680,
+    "oasis-3": 1264 / 1680,
+    "scribe": 1860 / 2480,
+    "colorsoft": 1264 / 1680,
+    "dx": 824 / 1200,
+}
+
+#: Family names map to the *most restrictive* ratio in that family, so the
+#: result fits every generation even when the exact model is unknown.
+_KINDLE_DEVICE_ALIASES: dict[str, str] = {
+    "paperwhite": "paperwhite-2",
+    "kpw": "paperwhite-2",
+    "pw": "paperwhite-2",
+    "paperwhite-11": "paperwhite-5",
+    "paperwhite-11th-gen": "paperwhite-5",
+    "paperwhite-12th-gen": "paperwhite-12",
+    "oasis": "oasis-1",
+    "oasis-2nd-gen": "oasis-2",
+    "oasis-3rd-gen": "oasis-3",
+    "scribe-2022": "scribe",
+    "scribe-2024": "scribe",
+    "kindle-2022": "kindle",
+    "kindle-2024": "kindle",
+    "kindle-12": "kindle",
+    "kindle-12th-gen": "kindle",
+    "kindle-11th-gen": "kindle-11",
+}
+
+
+#: Special `device_type` values that explicitly mean "no ratio limit".
+_NO_DEVICE_VALUES = {"none", "no", "off", "unlimited", "native", "-"}
+
+
+def kindle_device_ratio(name: str) -> float | None:
+    """Look up a Kindle model name and return its landscape height/width ratio."""
+    key = name.strip().lower().replace("_", "-").replace(" ", "-")
+    if key.startswith("amazon-"):
+        key = key[len("amazon-"):]
+    key = _KINDLE_DEVICE_ALIASES.get(key, key)
+    if key.startswith("kindle-") and key not in KINDLE_DEVICE_RATIOS:
+        key = key[len("kindle-"):]
+        # resolve family aliases such as "kindle-paperwhite" / "kindle-oasis"
+        key = _KINDLE_DEVICE_ALIASES.get(key, key)
+    return KINDLE_DEVICE_RATIOS.get(key)
+
+
 @dataclass
 class Config:
     # -- margin cropping ---------------------------------------------------
@@ -53,6 +116,13 @@ class Config:
     split_overlap_ratio: float | None = None
     #: ...and at least this many points (so a normal text line survives).
     split_overlap_min_pt: float | None = None
+    #: Maximum height/width ratio for split output pages.  Kindle screens in
+    #: landscape have height/width = portrait_width / portrait_height (e.g.
+    #: 0.75 for a 3:4 panel); pages that are taller are padded with blank
+    #: space on the left and right instead of needing two screenfuls.
+    split_max_aspect_ratio: float | None = None
+    #: Kindle model name; derives `split_max_aspect_ratio` from its screen.
+    device_type: str | None = None
 
     # -- rendering ----------------------------------------------------------
     #: DPI used for content analysis (raster projections).
@@ -90,4 +160,34 @@ class Config:
             raise ValueError("split_overlap_ratio must be in (0, 0.25)")
         if c.split_overlap_min_pt is not None and c.split_overlap_min_pt < 1.0:
             raise ValueError("split_overlap_min_pt must be >= 1 pt")
+        if c.device_type is not None:
+            if not c.split:
+                raise ValueError("device_type requires split=True")
+            if c.device_type.strip().lower() in _NO_DEVICE_VALUES:
+                c.device_type = None
+            else:
+                ratio = kindle_device_ratio(c.device_type)
+                if ratio is None:
+                    available = ", ".join(sorted(KINDLE_DEVICE_RATIOS))
+                    raise ValueError(
+                        f"unknown device_type {c.device_type!r}; "
+                        f"choose from: {available}"
+                    )
+                if (
+                    c.split_max_aspect_ratio is not None
+                    and abs(c.split_max_aspect_ratio - ratio) > 1e-12
+                ):
+                    raise ValueError(
+                        "device_type and split_max_aspect_ratio "
+                        "are mutually exclusive"
+                    )
+                c.split_max_aspect_ratio = ratio
+        if c.split_max_aspect_ratio is not None:
+            if not c.split:
+                raise ValueError("split_max_aspect_ratio requires split=True")
+            if not 0.0 < c.split_max_aspect_ratio <= 1.0:
+                raise ValueError(
+                    "split_max_aspect_ratio must be in (0, 1] "
+                    "(page height / page width)"
+                )
         return c
