@@ -52,7 +52,6 @@ class PageFeatures:
     # internal analysis scratch (not part of the public model)
     _repeat_top: "set[str]" = None
     _repeat_bottom: "set[str]" = None
-    _rep_top: bool = False
     _rep_bottom: bool = False
     _line_gap_pt: float | None = None
     _band_top_end: float | None = None

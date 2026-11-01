@@ -63,7 +63,7 @@ def test_scanned_page_trims_margins_and_footer(scan_pdf):
 def test_rotated_page_keeps_content(scan_rot_pdf):
     import numpy as np
 
-    from kindle_pdf_cropper.analysis import _binary_open, _remove_border_blobs
+    from kindle_pdf_cropper.analysis import _remove_border_blobs
 
     plans, feats = analyze(str(scan_rot_pdf))
     p0, f0 = plans[0], feats[0]
@@ -72,7 +72,7 @@ def test_rotated_page_keeps_content(scan_rot_pdf):
     # correct behaviour is a *tight* crop around that content, not a bogus
     # band trim that removes it.  Use the cleaned mask (specks/paper grain
     # deliberately excluded) as the content reference.
-    content = _remove_border_blobs(_binary_open(f0.ink, 1))
+    content = _remove_border_blobs(f0.ink, max_speck_area=3)
     ys, xs = np.nonzero(content)
     assert xs.size
     block_pt = f0.block * f0.pt_per_px
@@ -133,6 +133,38 @@ def test_scan_edge_mark_and_close_footer_are_ignored(furniture_scan_pdf):
         assert plan.crop.y1 < plan.height * 0.82, plan.crop
     assert sum(1 for p in plans if p.removed_top is not None) >= 4
     assert sum(1 for p in plans if p.removed_bottom is not None) >= 4
+
+
+def test_full_width_lines_touching_page_edge_are_kept(edge_text_scan_pdf):
+    """Regression: a body line ending at the paper edge must not be removed
+    as a "thin scan border".  Doing so collapsed the column projection and
+    cropped away the right half of tightly scanned pages."""
+    plans, _ = analyze(str(edge_text_scan_pdf))
+    for plan in plans:
+        assert plan.crop.x1 >= plan.width - 6, plan.crop
+        assert plan.crop.width > 0.8 * plan.width, plan.crop
+        # ...and a line that runs into the top/bottom edge must survive too
+        assert plan.crop.y0 <= 8, plan.crop
+        assert plan.crop.y1 >= plan.height - 8, plan.crop
+
+
+def test_sparse_page_signature_not_eaten_as_footer(preface_scan_pdf):
+    """Regression: a right-aligned signature at the bottom of a sparse page is
+    separated from the body by a large blank gap.  It is real content and must
+    survive (the over-eager footer rule used to crop it away)."""
+    plans, _ = analyze(str(preface_scan_pdf))
+    for plan in plans:
+        assert plan.removed_bottom is None, plan.removed_bottom
+        assert plan.crop.y1 > plan.height * 0.78, plan.crop
+
+
+def test_bottom_part_title_not_eaten_as_footer(bottom_title_scan_pdf):
+    """Regression: a centered part title sitting at the bottom of a sparse TOC
+    opener is real content, not a page number, and must survive."""
+    plans, _ = analyze(str(bottom_title_scan_pdf))
+    for plan in plans:
+        assert plan.removed_bottom is None, plan.removed_bottom
+        assert plan.crop.y1 > plan.height * 0.85, plan.crop
 
 
 def test_blank_page_is_left_alone(tmp_path):

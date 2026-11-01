@@ -417,66 +417,6 @@ def _top_header_band(
     return line_like or first_small
 
 
-def _top_band_signature(
-    feats: PageFeatures, zone: float
-) -> bytes | None:
-    """16x8 normalized signature of a page's running-header candidate band,
-    aligned to the band itself so position and height differences do not
-    matter."""
-    hb, wb = feats.ink.shape
-    zone_blk = max(1, int(zone * hb))
-    small_band = max(6, int(0.05 * hb))
-    g = _top_header_band(feats, zone, zone_blk, small_band)
-    if g is None:
-        return None
-    r0 = max(0, g[0] - 1)
-    r1 = min(hb - 1, g[1] + 1)
-    region = feats.ink[r0 : r1 + 1, :]
-    rows_idx = np.linspace(0, region.shape[0] - 1, 16).astype(int)
-    cols_idx = np.linspace(0, region.shape[1] - 1, 8).astype(int)
-    return region[np.ix_(rows_idx, cols_idx)].tobytes()
-
-
-def _repeated_strip_signatures(
-    feats_list: list[PageFeatures], zone: float
-) -> set[int]:
-    """Return the set of page indices whose top band is a *running header*.
-
-    Two signals, either suffices:
-
-    1. clustering: the same band signature appears on >= max(3, 1%) pages;
-    2. adjacency: the signature is nearly identical (<= 25% differing bits)
-       on consecutive pages -- chapter/section headers repeat on every page
-       of the section, so even a 2-page section is caught.
-    """
-    from collections import Counter
-
-    n = len(feats_list)
-    if n == 0:
-        return set()
-    sigs: dict[int, bytes | None] = {}
-    for feats in feats_list:
-        sigs[feats.index] = _top_band_signature(feats, zone)
-    repeated: set[int] = set()
-    # --- 1) clustering ------------------------------------------------
-    min_count = max(3, math.ceil(0.01 * n))
-    counts = Counter(sigs.values())
-    for idx, s in sigs.items():
-        if s is not None and counts[s] >= min_count:
-            repeated.add(idx)
-    # --- 2) adjacency ---------------------------------------------------
-    order = sorted(sigs)
-    for a, b in zip(order, order[1:]):
-        sa, sb = sigs[a], sigs[b]
-        if sa is None or sb is None:
-            continue
-        differing = sum(x != y for x, y in zip(sa, sb))
-        if differing <= 0.25 * len(sa):
-            repeated.add(a)
-            repeated.add(b)
-    return repeated
-
-
 def _repeated_footer_bands(
     feats_list: list[PageFeatures], zone: float
 ) -> set[int]:
@@ -532,7 +472,6 @@ def _detect_band(
     zone: float,
     repeat_keys: set[str],
     gap_factor: float,
-    rep_top: bool = False,
     rep_bottom: bool = False,
 ) -> tuple[float | None, float | None]:
     """Detect a header (sign=-1) or footer (sign=+1) band.
@@ -541,20 +480,18 @@ def _detect_band(
     the band that should be cropped away -- or ``(None, None)`` when nothing
     qualifies.
 
-    Geometric signal (works for scans): the topmost / bottommost ink group is
-    treated as a header / footer band when it is *small* and either
+    Geometric signal (works for scans): a header / footer is only accepted
+    when it looks like page furniture rather than content:
 
-    * ``rep_top`` -- the page's top strip matches a strip repeated across
-      many pages (cross-page running-header detection, robust against
-      tight layouts where the header sits exactly one line-gap above the
-      body), or
-    * it is separated from the body by a gap clearly wider than the median
-      line gap, or
-    * it is a small, low-coverage (centered) band very close to the page
-      edge (fallback for tight layouts without repetition).
+    * a *header* must be a very small, horizontally centered band right at
+      the top edge, clearly separated from the body;
+    * a *footer* must either be a repeated narrow bottom band
+      (``rep_bottom``) or a unique tiny number-like band near the bottom
+      edge, clearly separated from the body.
 
-    A *footer* additionally requires a separation gap wider than the median
-    line gap (so the last body line on a short page is never eaten).
+    This deliberately leaves chapter titles, part titles, footnotes,
+    signatures, TOC lines and figure labels alone: on a tightly scanned book
+    those are real content and cutting them makes pages unreadable.
 
     Textual signal: repeated running header/footer text lines and
     page-number-like lines (born-digital PDFs).
@@ -595,9 +532,31 @@ def _detect_band(
             if g is not None:
                 sep_gap = fine[1][0] - g[1] - 1 if len(fine) > 1 else 0
                 band = feats.ink[g[0] : g[1] + 1, :]
-                coverage = (band.sum(axis=0) > 0).mean()
-                centered = coverage <= 0.5 and g[0] <= int(0.13 * hb)
-                if rep_top or sep_gap > ref_gap_blk + 0.5 or centered:
+                cols = np.nonzero(band.sum(axis=0) > 0)[0]
+                coverage = band.sum(axis=0).astype(bool).mean()
+                cx = (
+                    (float(cols.min()) + float(cols.max())) / 2.0
+                    / max(wb - 1, 1)
+                    if cols.size
+                    else 0.5
+                )
+                # Only a very small, horizontally centered band right at the
+                # top edge and clearly separated from the body is treated as
+                # a page number / header ornament.  A full-width band (boxed
+                # section heading, figure axis labels), a chapter title, or a
+                # normal first body line must never be removed just because
+                # it is followed by blank space.  Repetition alone is not
+                # enough either: table-of-contents pages and ordinary text
+                # pages often have visually similar top lines.
+                separated = sep_gap > ref_gap_blk + 0.5
+                header_unique = (
+                    separated
+                    and coverage <= 0.35
+                    and abs(cx - 0.5) <= 0.12
+                    and (g[1] - g[0] + 1) <= max(2, int(0.04 * hb))
+                    and g[0] <= max(2, int(0.08 * hb))
+                )
+                if header_unique:
                     end = g[1]
                     grow_cap = max(2, int(0.015 * hb))
                     grown = 0
@@ -611,13 +570,18 @@ def _detect_band(
             g = fine[-1]
             # footer must be a *small, narrow* band (page number etc.),
             # not a full-width paragraph that happens to end the page
-            small_footer = max(3, int(0.04 * hb), int(2.0 * line_h))
-            if (
-                g[1] >= hb - zone_blk - 1
-                and (g[1] - g[0] + 1) <= small_footer
-            ):
+            small_footer = max(3, int(0.025 * hb), int(1.5 * line_h))
+            band_h = g[1] - g[0] + 1
+            if g[1] >= hb - zone_blk - 1 and band_h <= small_footer:
                 band = feats.ink[g[0] : g[1] + 1, :]
-                coverage = (band.sum(axis=0) > 0).mean()
+                cols = np.nonzero(band.sum(axis=0) > 0)[0]
+                coverage = band.sum(axis=0).astype(bool).mean()
+                cx = (
+                    (float(cols.min()) + float(cols.max())) / 2.0
+                    / max(wb - 1, 1)
+                    if cols.size
+                    else 0.5
+                )
                 prev_gap = g[0] - fine[-2][1] - 1 if len(fine) > 1 else 0
                 # A repeated narrow bottom band is page furniture even when
                 # the gap above it is only one normal line gap (common when
@@ -625,9 +589,21 @@ def _detect_band(
                 repeated_furniture = (
                     rep_bottom and coverage <= 0.55 and prev_gap >= 1
                 )
-                if (
-                    prev_gap > ref_gap_blk + 0.5 or repeated_furniture
-                ) and coverage <= 0.7:
+                # A *unique* bottom band may still be a page number, but it
+                # must look like one: short, narrow, centered like a page
+                # number, in the outer bottom strip and clearly separated
+                # from the body.  Section headings, footnotes and signatures
+                # are taller, wider or off-centre and must never be eaten
+                # (they are real content on otherwise sparse pages).
+                near_bottom = g[1] >= hb - max(3, int(0.10 * hb)) - 1
+                page_number_like = (
+                    coverage <= 0.35
+                    and abs(cx - 0.5) <= 0.15
+                    and band_h <= max(2, int(0.06 * hb))
+                    and near_bottom
+                    and prev_gap > ref_gap_blk + 0.5
+                )
+                if repeated_furniture or page_number_like:
                     start = g[0]
                     grow_cap = max(2, int(0.015 * hb))
                     grown = 0
@@ -687,51 +663,45 @@ def _detect_band(
     return None, None
 
 
-def _binary_open(mask: np.ndarray, radius: int = 1) -> np.ndarray:
-    """Morphological opening (erode then dilate) on a boolean grid.
-
-    Implemented with numpy shifts so analysis keeps its numpy/Pillow-only
-    dependencies.  Used to delete tiny isolated specks -- dust, scanner
-    edge marks, watermark crumbs -- before measuring the content bounding
-    box.  Full text lines and figures (wider/taller than ``2*radius``)
-    survive untouched.
-    """
-    if radius <= 0 or not mask.any():
-        return mask
-
-    def shift(m: np.ndarray, dy: int, dx: int) -> np.ndarray:
-        h, w = m.shape
-        out = np.zeros_like(m)
-        ys0, ys1 = max(0, dy), min(h, h + dy)
-        xs0, xs1 = max(0, dx), min(w, w + dx)
-        yd0, yd1 = max(0, -dy), min(h, h - dy)
-        xd0, xd1 = max(0, -dx), min(w, w - dx)
-        out[ys0:ys1, xs0:xs1] = m[yd0:yd1, xd0:xd1]
-        return out
-
-    eroded = mask
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            eroded = eroded & shift(mask, dy, dx)
-    grown = eroded
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            grown = grown | shift(eroded, dy, dx)
-    return grown
-
-
 def _remove_border_blobs(
     mask: np.ndarray,
     max_area_share: float = 0.12,
     max_thickness_share: float = 0.12,
+    max_thickness_blocks: int = 3,
+    max_speck_area: int = 0,
 ) -> np.ndarray:
-    """Drop thin blobs that touch the page boundary (scan borders / shadows).
+    """Drop left/right scan-border strips and (optionally) tiny isolated specks.
 
-    Scanned books often carry a black strip along one or more paper edges.
-    The strip is connected to the page boundary and is thin, whereas real
-    content either does not touch the boundary or is a large full-bleed
-    image.  Any border-touching component that is both thin and small
-    relative to the total ink is therefore treated as an artifact.
+    Scanned books often carry a black strip along the left or right paper
+    edge.  The strip is connected to the page boundary and is thin, whereas
+    real content either does not touch the boundary or is a large full-bleed
+    image.  A border-touching component that is both thin and small relative
+    to the total ink is therefore treated as an artifact.
+
+    A blob only counts as a side strip when it is attached to the border
+    along its *long* side.  This is essential on tightly scanned pages: a
+    body text line can end at the paper edge, so its bounding box touches the
+    border, but only with the line's short side.  The earlier version only
+    checked "touches border + thin bbox", which deleted every full-width line
+    reaching the edge; the remaining half-width lines then pulled the crop
+    inward and cut off the right half of the page.
+
+    Only left/right strips are dropped: a text line that runs into the
+    top/bottom edge (a figure axis label, or the last body line of a tightly
+    cropped scan) is equally thin and can even be nearly solid, so the same
+    test would delete real text.  A top/bottom shadow sliver merely leaves
+    the crop a few points taller, which is harmless.
+
+    Thickness is also capped in absolute block units (``max_thickness_blocks``
+    ~ 24 analysis pixels / 12 pt): a 4-block-tall text line is never a scan
+    strip, no matter how large the page is.
+
+    When ``max_speck_area > 0``, components anywhere on the page whose area
+    is at most that many block cells are dropped as dust.  This is the safe
+    replacement for running a morphological opening on the *block* mask:
+    opening erodes glyph strokes (a Chinese character stroke is often only
+    2-3 blocks thick), shrinking the measured content box and clipping text
+    at the page margins.
 
     A dark cover / full-page image forms one big component made of nearly
     all the ink, so ``area <= max_area_share * total`` protects it.
@@ -742,8 +712,14 @@ def _remove_border_blobs(
         return mask
     seen = np.zeros((h, w), dtype=bool)
     out = mask.copy()
-    max_thick_h = max(2, int(round(max_thickness_share * h)))
-    max_thick_w = max(2, int(round(max_thickness_share * w)))
+    max_thick_h = min(
+        max_thickness_blocks,
+        max(2, int(round(max_thickness_share * h))),
+    )
+    max_thick_w = min(
+        max_thickness_blocks,
+        max(2, int(round(max_thickness_share * w))),
+    )
     ys, xs = np.nonzero(mask)
     for sy, sx in zip(ys.tolist(), xs.tolist()):
         if seen[sy, sx]:
@@ -758,15 +734,33 @@ def _remove_border_blobs(
                 if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
                     seen[ny, nx] = True
                     stack.append((ny, nx))
+        n = len(cells)
+        if 0 < max_speck_area and n <= max_speck_area:
+            for y, x in cells:
+                out[y, x] = False
+            continue
         ys_c = [c[0] for c in cells]
         xs_c = [c[1] for c in cells]
         y0, y1 = min(ys_c), max(ys_c)
         x0, x1 = min(xs_c), max(xs_c)
-        touches_border = x0 == 0 or y0 == 0 or x1 == w - 1 or y1 == h - 1
-        if not touches_border:
-            continue
-        thin = (x1 - x0 + 1) <= max_thick_w or (y1 - y0 + 1) <= max_thick_h
-        if thin and len(cells) <= max_area_share * total:
+        bh = y1 - y0 + 1
+        bw = x1 - x0 + 1
+        # length of the run where this blob sits on the left/right paper edge.
+        # Only *side* strips are removed: a top/bottom text line (figure axis
+        # label, last body line) also runs into the edge, is just as thin and
+        # can even be nearly solid, so removing it would cut real text.  A
+        # sliver of shadow at the top/bottom only makes the crop a few points
+        # taller, which is harmless.
+        side_contact = bh if (x0 == 0 or x1 == w - 1) else 0
+        if side_contact == 0:
+            continue  # not touching a side border
+        major = max(bw, bh)
+        thin = bw <= max_thick_w or bh <= max_thick_h
+        if (
+            thin
+            and side_contact >= 0.5 * major
+            and n <= max_area_share * total
+        ):
             for y, x in cells:
                 out[y, x] = False
     return out
@@ -802,10 +796,10 @@ def _body_bounds(
 ) -> tuple[float, float, float, float]:
     """(x0, y0, x1, y1) of visible body content in pt, from raster + text.
 
-    The raster box is measured on a lightly opened mask and with a small
-    mass trim, so an isolated speck / watermark crumb / edge scratch cannot
-    stretch the crop to the page edge (a very common failure on scans whose
-    paper edge carries a few dark pixels).
+    The raster box is measured on a mask with border strips, dust specks and
+    a small mass trim removed, so an isolated speck / watermark crumb / edge
+    scratch cannot stretch the crop to the page edge (a very common failure
+    on scans whose paper edge carries a few dark pixels).
     """
     hb = feats.ink.shape[0]
     block = feats.block
@@ -821,8 +815,12 @@ def _body_bounds(
     if hi < lo:
         return 0.0, 0.0, width, height
 
-    sub = _binary_open(feats.ink[lo : hi + 1, :], 1)
-    sub = _remove_border_blobs(sub)
+    # drop scan-border strips plus isolated dust specks, but never erode the
+    # ink itself: at block resolution a glyph stroke is only 2-3 cells thick,
+    # so a morphological opening would eat the text and shrink the crop
+    sub = _remove_border_blobs(
+        feats.ink[lo : hi + 1, :], max_speck_area=3
+    )
     if not sub.any():
         return 0.0, 0.0, width, height
 
@@ -877,12 +875,11 @@ def _crop_rect(feats: PageFeatures, config: Config) -> fitz.Rect:
     bot_start: float | None = None
     if config.header_footer_zone > 0:
         _, top_end = _detect_band(
-            feats, -1, zone, feats._repeat_top, config.hf_gap_factor,
-            rep_top=feats._rep_top,
+            feats, -1, zone, feats._repeat_top, config.hf_gap_factor
         )
         bot_start, _ = _detect_band(
             feats, +1, zone, feats._repeat_bottom, config.hf_gap_factor,
-            rep_top=feats._rep_top, rep_bottom=feats._rep_bottom,
+            rep_bottom=feats._rep_bottom,
         )
         total_trim = (top_end or 0.0) + (
             feats.height - (bot_start or feats.height)
@@ -955,9 +952,6 @@ def analyze_document(
             elif ln.vfrac > 1.0 - zone and not _is_page_number(ln):
                 counters[+1][ln.norm_text] += 1
 
-    # cross-page top-strip repetition for scanned pages (running headers in
-    # scans have no text layer; the strip signature clusters identical pages)
-    rep_sigs = _repeated_strip_signatures(feats_list, zone)
     # cross-page bottom-band repetition (page number + rule sitting directly
     # under the last body line, too close for a gap-only test)
     rep_footers = _repeated_footer_bands(feats_list, zone)
@@ -985,7 +979,6 @@ def analyze_document(
     for feats in feats_list:
         feats._repeat_top = {k for k, c in counters[-1].items() if c >= min_pages}
         feats._repeat_bottom = {k for k, c in counters[+1].items() if c >= min_pages}
-        feats._rep_top = feats.index in rep_sigs
         feats._rep_bottom = feats.index in rep_footers
         feats._line_gap_pt = global_line_gap
         feats._band_top_end = None

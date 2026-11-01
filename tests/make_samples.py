@@ -273,6 +273,137 @@ def make_furniture_scan_pdf(path: str, pages: int = 5) -> str:
     return path
 
 
+def _make_edge_text_scan_page(w: int, h: int, page_no: int) -> Image.Image:
+    """Tight scan whose body lines run all the way to the right paper edge.
+
+    This is common in real books: the scan is cropped at the text block, so
+    every line's bounding box touches the page border.  A border-strip filter
+    must not mistake those lines for scanner shadows.
+    """
+    img = Image.new("L", (w, h), 248)
+    d = ImageDraw.Draw(img)
+    try:
+        f_body = ImageFont.load_default(size=34)
+    except TypeError:  # very old Pillow
+        f_body = ImageFont.load_default()
+    rnd = random.Random(page_no * 911)
+    for _ in range(2000):
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        img.putpixel((x, y), 238 + rnd.randrange(10))
+    # first line touches the top edge, last line touches the bottom edge
+    y = 4
+    for ln in range(16):
+        text = (
+            f"Tight line {ln} of page {page_no} with body text that is cut "
+            "exactly at the paper edge"
+        )
+        tw = d.textlength(text, font=f_body)
+        # start so the last glyph is clipped by the page edge; the line's
+        # bbox therefore touches the right border along its short side
+        d.text((w - tw + 3, y), text, fill=45, font=f_body)
+        y += 62
+    d.text(
+        (4, h - 26),
+        f"full width bottom line of page {page_no} reaching both paper edges "
+        "and continuing on and on",
+        fill=45,
+        font=f_body,
+    )
+    return img
+
+
+def _make_preface_scan_page(w: int, h: int, page_no: int) -> Image.Image:
+    """Scan of a preface end: a short body block, a huge blank gap, then a
+    right-aligned signature.  The signature is separated from the body by
+    much more than a line gap, so a naive footer detector would carry it away
+    even though it is real content."""
+    img = Image.new("L", (w, h), 248)
+    d = ImageDraw.Draw(img)
+    try:
+        f_body = ImageFont.load_default(size=34)
+    except TypeError:  # very old Pillow
+        f_body = ImageFont.load_default()
+    rnd = random.Random(page_no * 577)
+    for _ in range(2000):
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        img.putpixel((x, y), 238 + rnd.randrange(10))
+    y = 160
+    for ln in range(7):
+        d.text(
+            (150, y),
+            f"Preface body line {ln} of page {page_no} ends the text block.",
+            fill=45,
+            font=f_body,
+        )
+        y += 60
+    base = h - 250 - (page_no - 1) * 40  # vary so it is not "repeated furniture"
+    for j, sig in enumerate(("Hersh Shefrin", f"October, 2004  ({page_no})")):
+        tw = d.textlength(sig, font=f_body)
+        d.text((w - 150 - tw, base + j * 60), sig, fill=45, font=f_body)
+    return img
+
+
+def make_preface_scan_pdf(path: str, pages: int = 4) -> str:
+    doc = fitz.open()
+    for i in range(pages):
+        img = _make_preface_scan_page(1240, 1754, i + 1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        page = doc.new_page(width=PAGE_W, height=PAGE_H)
+        page.insert_image(fitz.Rect(0, 0, PAGE_W, PAGE_H), stream=buf.getvalue())
+    doc.save(path, garbage=4, deflate=True)
+    doc.close()
+    return path
+
+
+def _make_bottom_title_scan_page(w: int, h: int, page_no: int) -> Image.Image:
+    """Page whose only large text is a centered part title near the bottom,
+    separated from a small top block by a huge blank gap (real TOC opener)."""
+    img = Image.new("L", (w, h), 248)
+    d = ImageDraw.Draw(img)
+    try:
+        f_body = ImageFont.load_default(size=34)
+        f_title = ImageFont.load_default(size=64)
+    except TypeError:  # very old Pillow
+        f_body = f_title = ImageFont.load_default()
+    rnd = random.Random(page_no * 641)
+    for _ in range(2000):
+        x, y = rnd.randrange(w), rnd.randrange(h)
+        img.putpixel((x, y), 238 + rnd.randrange(10))
+    d.text((180, 170), f"TOC entry {page_no}", fill=45, font=f_body)
+    d.text((180, 260), f"another entry {page_no}", fill=45, font=f_body)
+    title = f"Part {page_no}: behavioural finance"
+    tw = d.textlength(title, font=f_title)
+    d.text(((w - tw) / 2, int(h * 0.82)), title, fill=30, font=f_title)
+    return img
+
+
+def make_bottom_title_scan_pdf(path: str, pages: int = 4) -> str:
+    doc = fitz.open()
+    for i in range(pages):
+        img = _make_bottom_title_scan_page(1240, 1754, i + 1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        page = doc.new_page(width=PAGE_W, height=PAGE_H)
+        page.insert_image(fitz.Rect(0, 0, PAGE_W, PAGE_H), stream=buf.getvalue())
+    doc.save(path, garbage=4, deflate=True)
+    doc.close()
+    return path
+
+
+def make_edge_text_scan_pdf(path: str, pages: int = 4) -> str:
+    doc = fitz.open()
+    for i in range(pages):
+        img = _make_edge_text_scan_page(1240, 1754, i + 1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        page = doc.new_page(width=PAGE_W, height=PAGE_H)
+        page.insert_image(fitz.Rect(0, 0, PAGE_W, PAGE_H), stream=buf.getvalue())
+    doc.save(path, garbage=4, deflate=True)
+    doc.close()
+    return path
+
+
 if __name__ == "__main__":
     import sys
 
